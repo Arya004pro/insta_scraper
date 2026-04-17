@@ -87,6 +87,17 @@ def enumerate_grid_posts(
         if shortcode:
             ordered[shortcode] = row
 
+    for shortcode, url, media_kind in _extract_media_links(page):
+        if shortcode not in ordered:
+            ordered[shortcode] = {
+                "shortcode": shortcode,
+                "post_url": url,
+                "media_type_hint": media_kind,
+            }
+
+    if settings.scroll_idle_rounds <= 0:
+        return list(ordered.values())
+
     idle_rounds = 0
     while idle_rounds < settings.scroll_idle_rounds:
         previous_count = len(ordered)

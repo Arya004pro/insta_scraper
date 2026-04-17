@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Instagram Scraper UI</title>
+  <style>
+    :root {
+      --bg: #0f1720;
+      --panel: #17232e;
+      --panel-2: #1e2f3e;
+      --text: #e7edf3;
+      --muted: #9fb0bf;
+      --accent: #24c2a5;
+      --warn: #ffb454;
+      --bad: #ff6b6b;
+      --ok: #70e000;
+      --border: #284052;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      background: radial-gradient(circle at top right, #15364a, var(--bg) 45%);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 1100px;
+      margin: 24px auto;
+      padding: 0 16px 32px;
+    }
+    h1 { margin: 0 0 14px; font-size: 1.6rem; }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 14px;
+    }
+    .card {
+      background: linear-gradient(180deg, var(--panel), var(--panel-2));
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    input[type="text"] {
+      flex: 1;
+      min-width: 260px;
+      background: #0f1d28;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 14px;
+    }
+    button {
+      background: var(--accent);
+      color: #001b16;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .small { color: var(--muted); font-size: 13px; }
+    .status { font-weight: 700; }
+    .status.running { color: var(--warn); }
+    .status.completed { color: var(--ok); }
+    .status.failed, .status.needs_human { color: var(--bad); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+    th, td {
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      padding: 8px;
+      vertical-align: top;
+      font-size: 13px;
+    }
+    th { color: var(--muted); font-weight: 600; width: 180px; }
+    a { color: #87d4ff; word-break: break-all; }
+    .sample-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .sample {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      background: #102030;
+    }
+    .muted { color: var(--muted); }
+    ul { margin: 6px 0 0 16px; padding: 0; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Instagram Scraper Dashboard</h1>
+
+    <div class="grid">
+      <section class="card">
+        <div class="row">
+          <input id="urlInput" type="text" value="https://www.instagram.com/indriyajewels/" placeholder="https://www.instagram.com/username/" />
+          <button id="startBtn">Start Run</button>
+        </div>
+        <div class="small" style="margin-top:8px;">Starts a scrape run, tracks live status, and shows profile + sample post/reel output links.</div>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <div>Run ID: <span id="runId" class="muted">-</span></div>
+          <div>Status: <span id="runStatus" class="status muted">idle</span></div>
+          <div>Progress: <span id="progressText" class="muted">-</span></div>
+        </div>
+        <div class="small" id="errorText" style="margin-top:6px;"></div>
+      </section>
+
+      <section class="card">
+        <h3 style="margin:0 0 8px;">Profile Snapshot</h3>
+        <div id="profileBox" class="small">No report loaded yet.</div>
+      </section>
+
+      <section class="card">
+        <h3 style="margin:0 0 8px;">Sample Outputs</h3>
+        <div id="sampleBox" class="small">No sample rows yet.</div>
+      </section>
+
+      <section class="card">
+        <h3 style="margin:0 0 8px;">Artifacts</h3>
+        <div id="artifactBox" class="small">No artifacts yet.</div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const startBtn = document.getElementById("startBtn");
+    const urlInput = document.getElementById("urlInput");
+    const runIdEl = document.getElementById("runId");
+    const runStatusEl = document.getElementById("runStatus");
+    const progressTextEl = document.getElementById("progressText");
+    const errorTextEl = document.getElementById("errorText");
+    const profileBox = document.getElementById("profileBox");
+    const sampleBox = document.getElementById("sampleBox");
+    const artifactBox = document.getElementById("artifactBox");
+
+    let pollTimer = null;
+    let currentRunId = null;
+
+    function setStatus(status) {
+      runStatusEl.textContent = status || "-";
+      runStatusEl.className = "status " + (status || "");
+    }
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>\"]/g, function (c) {
+        return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c];
+      });
+    }
+
+    function linkList(items) {
+      if (!items || !items.length) return "<span class='muted'>none</span>";
+      return "<ul>" + items.map(x => `<li><a href="${esc(x)}" target="_blank">${esc(x)}</a></li>`).join("") + "</ul>";
+    }
+
+    async function startRun() {
+      const url = (urlInput.value || "").trim();
+      if (!url) {
+        alert("Enter a profile URL.");
+        return;
+      }
+      startBtn.disabled = true;
+      errorTextEl.textContent = "";
+
+      try {
+        const resp = await fetch("/v1/runs/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            input_type: "single_url",
+            input_value: url,
+            use_saved_session: true
+          })
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || "Failed to start run");
+
+        currentRunId = data.run_id;
+        runIdEl.textContent = currentRunId;
+        setStatus(data.status);
+        progressTextEl.textContent = `${data.progress_pct ?? 0}% - ${data.progress_message || "starting"}`;
+        startPolling();
+      } catch (err) {
+        errorTextEl.textContent = String(err.message || err);
+      } finally {
+        startBtn.disabled = false;
+      }
+    }
+
+    function startPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(pollStatus, 3000);
+      pollStatus();
+    }
+
+    async function pollStatus() {
+      if (!currentRunId) return;
+      try {
+        const resp = await fetch(`/v1/runs/${currentRunId}`);
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || "status error");
+
+        setStatus(data.status);
+        progressTextEl.textContent = `${data.progress_pct ?? 0}% - ${data.progress_message || ""}`;
+        if (data.error_message) {
+          errorTextEl.textContent = `${data.error_code || "error"}: ${data.error_message}`;
+        }
+
+        if (["completed", "failed", "needs_human", "skipped_private"].includes(data.status)) {
+          clearInterval(pollTimer);
+          await loadReport();
+        }
+      } catch (err) {
+        clearInterval(pollTimer);
+        errorTextEl.textContent = String(err.message || err);
+      }
+    }
+
+    async function loadReport() {
+      if (!currentRunId) return;
+      const resp = await fetch(`/v1/runs/${currentRunId}/report`);
+      const data = await resp.json();
+      if (!resp.ok) {
+        errorTextEl.textContent = data.detail || "Could not load report";
+        return;
+      }
+
+      renderProfile(data.profile);
+      renderSamples(data.samples || {});
+      renderArtifacts(data.artifacts || {});
+    }
+
+    function renderProfile(profile) {
+      if (!profile) {
+        profileBox.innerHTML = "<span class='muted'>Profile CSV not available.</span>";
+        return;
+      }
+      const rows = [
+        ["Username", profile.username],
+        ["Full Name", profile.full_name],
+        ["Followers", profile.followers_count],
+        ["Following", profile.following_count],
+        ["Posts", profile.total_posts_count],
+        ["Date Joined", profile.date_joined],
+        ["Based In", profile.account_based_in],
+        ["Verified Time", profile.time_verified],
+      ];
+      profileBox.innerHTML = `<table>${rows.map(([k,v]) => `<tr><th>${esc(k)}</th><td>${esc(v || "")}</td></tr>`).join("")}</table>`;
+    }
+
+    function renderSampleCard(title, item) {
+      if (!item) {
+        return `<div class="sample"><strong>${esc(title)}</strong><div class="muted" style="margin-top:6px;">Not captured in this run.</div></div>`;
+      }
+      return `
+        <div class="sample">
+          <strong>${esc(title)}</strong>
+          <table>
+            <tr><th>Post URL</th><td><a href="${esc(item.post_url)}" target="_blank">${esc(item.post_url)}</a></td></tr>
+            <tr><th>Media Type</th><td>${esc(item.media_type)}</td></tr>
+            <tr><th>Likes</th><td>${esc(item.likes_count)}</td></tr>
+            <tr><th>Comments</th><td>${esc(item.comments_count)}</td></tr>
+            <tr><th>Views</th><td>${esc(item.views_count)}</td></tr>
+            <tr><th>Hashtags</th><td>${esc(item.hashtags_csv || "")}</td></tr>
+            <tr><th>Keywords</th><td>${esc(item.keywords_csv || "")}</td></tr>
+            <tr><th>Mentions</th><td>${esc(item.mentions_csv || "")}</td></tr>
+          </table>
+          <div class="small">Remote media URLs:</div>
+          ${linkList(item.media_asset_urls || [])}
+          <div class="small" style="margin-top:6px;">Local output files:</div>
+          ${linkList(item.media_asset_local_urls || [])}
+        </div>
+      `;
+    }
+
+    function renderSamples(samples) {
+      sampleBox.innerHTML = `
+        <div class="sample-grid">
+          ${renderSampleCard("Single Image Post", samples.single_image_post)}
+          ${renderSampleCard("Multi Image Post", samples.multi_image_post)}
+          ${renderSampleCard("Reel", samples.reel)}
+        </div>
+      `;
+    }
+
+    function renderArtifacts(artifacts) {
+      const keys = Object.keys(artifacts);
+      if (!keys.length) {
+        artifactBox.innerHTML = "<span class='muted'>No artifacts yet.</span>";
+        return;
+      }
+      artifactBox.innerHTML = "<ul>" + keys.map(k => {
+        const item = artifacts[k];
+        const state = item.exists ? "ready" : "missing";
+        return `<li><a href="${esc(item.download_url)}" target="_blank">${esc(k)}</a> <span class='muted'>(${state})</span></li>`;
+      }).join("") + "</ul>";
+    }
+
+    startBtn.addEventListener("click", startRun);
+  </script>
+</body>
+</html>

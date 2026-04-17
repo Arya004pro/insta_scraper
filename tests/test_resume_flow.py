@@ -19,8 +19,9 @@ def make_settings(tmp_path: Path) -> Settings:
     data_dir = tmp_path / "data"
     runs_dir = data_dir / "runs"
     browser_state_dir = data_dir / "browser_state"
+    media_dir = data_dir / "media"
     exports_dir = tmp_path / "exports"
-    for p in [data_dir, runs_dir, browser_state_dir, exports_dir]:
+    for p in [data_dir, runs_dir, browser_state_dir, media_dir, exports_dir]:
         p.mkdir(parents=True, exist_ok=True)
     return Settings(
         app_name="test",
@@ -30,6 +31,7 @@ def make_settings(tmp_path: Path) -> Settings:
         runs_dir=runs_dir,
         browser_state_dir=browser_state_dir,
         exports_dir=exports_dir,
+        media_dir=media_dir,
         sqlite_path=data_dir / "state.sqlite3",
         brave_executable_path=None,
         brave_user_data_dir=None,
@@ -46,6 +48,10 @@ def make_settings(tmp_path: Path) -> Settings:
         request_timeout_seconds=10,
         retry_max_attempts=2,
         retry_base_delay_seconds=0.1,
+        challenge_auto_retry_attempts=1,
+        challenge_auto_retry_wait_seconds=0.1,
+        rate_limit_cooldown_seconds=0.1,
+        sample_collection_mode=False,
         max_posts_per_profile=None,
         proxies=[],
     )

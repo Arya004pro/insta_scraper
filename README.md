@@ -16,6 +16,8 @@ set BRAVE_USER_DATA_DIR=C:\Users\<YOUR_USER>\AppData\Local\BraveSoftware\Brave-B
 set BRAVE_PROFILE_DIRECTORY=Default
 ```
 
+On Windows/macOS/Linux, the app now auto-detects common Brave install paths and user-data folders when these env vars are not set.
+
 If Brave is currently open, the scraper can auto-clone your profile snapshot instead of failing:
 
 ```bash
@@ -41,6 +43,26 @@ Post cap control (0 or unset means scan all posts):
 set MAX_POSTS_PER_PROFILE=0
 ```
 
+Sample mode controls (default is enabled for quick test runs):
+
+```bash
+set SAMPLE_COLLECTION_MODE=1
+```
+
+In sample mode, the scraper targets exactly one sample each for:
+
+- single image post
+- multi image post
+- reel
+
+It first uses timeline snapshot data, then falls back to only currently visible grid items (no deep scroll), which helps reduce 429 rate-limit errors.
+
+To force full crawling behavior instead of sample mode:
+
+```bash
+set SAMPLE_COLLECTION_MODE=0
+```
+
 Speed tuning controls:
 
 ```bash
@@ -49,6 +71,13 @@ set SCROLL_PAUSE_MAX_MS=900
 set POST_DETAIL_WAIT_MS=300
 set BROWSER_VIEWPORT_WIDTH=1100
 set BROWSER_VIEWPORT_HEIGHT=750
+```
+
+Challenge auto-recovery controls (best effort before pausing run):
+
+```bash
+set CHALLENGE_AUTO_RETRY_ATTEMPTS=3
+set CHALLENGE_AUTO_RETRY_WAIT_SECONDS=8
 ```
 
 Optional headless mode for Brave:
@@ -74,12 +103,44 @@ set BROWSER_HEADLESS=1
 
 Exports are written to `exports/`:
 
-- `*_normalized.xlsx`
-- `*_master_summary.xlsx` (human-readable column names + readable IST timestamp)
 - `*_posts.csv`
+- `*_reels.csv`
 - `*_master_summary.csv`
-- supporting CSVs for run log/profile/highlights/external links/aggregates
 
-Normalized sheets keep `scraped_at_ist` as the first column.
+Sample media files are stored under `scraped_media/<profile_name>/` in the project root:
+
+or under `Output/<profile_name>/` if using default settings.
+
+- `posts/`
+- `reels/`
+- `multi_image_posts/`
+
+Filenames are timestamped for latest extraction visibility:
+
+- `<timestamp>_<runid8>_<shortcode>_<index>.<ext>`
+
+`profile.csv` now includes About fields: `date_joined`, `account_based_in`, `active_ads_status`, `active_ads_url`, and `time_verified`.
+
 Master summary uses readable labels (for example, `Scraped At (IST)`, `All Time Reel %`, and URL-based top post/reel columns).
+
+## Local UI
+
+Start API server:
+
+```bash
+uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Open dashboard:
+
+- `http://127.0.0.1:8000/`
+
+The UI lets you:
+
+- provide a profile URL and start a run
+- watch live run status
+- view sample rows for single-image post, multi-image post, and reel
+- open source post/reel URLs used for samples
+- download run artifacts (master, posts, reels)
+- open local sample media files from `Output/`
 

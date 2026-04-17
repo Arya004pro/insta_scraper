@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,7 @@ class Settings:
     runs_dir: Path
     browser_state_dir: Path
     exports_dir: Path
+    media_dir: Path
     sqlite_path: Path
     brave_executable_path: str | None
     brave_user_data_dir: str | None
@@ -54,6 +56,10 @@ class Settings:
     request_timeout_seconds: int
     retry_max_attempts: int
     retry_base_delay_seconds: float
+    challenge_auto_retry_attempts: int
+    challenge_auto_retry_wait_seconds: float
+    rate_limit_cooldown_seconds: float
+    sample_collection_mode: bool
     max_posts_per_profile: int | None
     proxies: list[ProxyConfig]
 
@@ -79,15 +85,93 @@ def _parse_proxy_pool(raw: str) -> list[ProxyConfig]:
     return result
 
 
+def _auto_detect_brave_executable_path() -> str | None:
+    configured = os.getenv("BRAVE_EXECUTABLE_PATH", "").strip()
+    if configured:
+        return configured
+
+    candidates: list[Path] = []
+    if os.name == "nt":
+        program_files = Path(os.getenv("ProgramFiles", ""))
+        program_files_x86 = Path(os.getenv("ProgramFiles(x86)", ""))
+        candidates.extend(
+            [
+                program_files
+                / "BraveSoftware"
+                / "Brave-Browser"
+                / "Application"
+                / "brave.exe",
+                program_files_x86
+                / "BraveSoftware"
+                / "Brave-Browser"
+                / "Application"
+                / "brave.exe",
+            ]
+        )
+    elif sys.platform == "darwin":
+        candidates.append(
+            Path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser")
+        )
+    else:
+        candidates.extend(
+            [
+                Path("/usr/bin/brave-browser"),
+                Path("/usr/bin/brave"),
+                Path("/snap/bin/brave"),
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _auto_detect_brave_user_data_dir() -> str | None:
+    configured = os.getenv("BRAVE_USER_DATA_DIR", "").strip()
+    if configured:
+        return configured
+
+    home = Path.home()
+    candidates: list[Path] = []
+    if os.name == "nt":
+        candidates.append(
+            home / "AppData" / "Local" / "BraveSoftware" / "Brave-Browser" / "User Data"
+        )
+    elif sys.platform == "darwin":
+        candidates.append(
+            home / "Library" / "Application Support" / "BraveSoftware" / "Brave-Browser"
+        )
+    else:
+        candidates.extend(
+            [
+                home / ".config" / "BraveSoftware" / "Brave-Browser",
+                home
+                / "snap"
+                / "brave"
+                / "current"
+                / ".config"
+                / "BraveSoftware"
+                / "Brave-Browser",
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def load_settings() -> Settings:
     root = Path(__file__).resolve().parents[2]
     data_dir = root / "data"
     runs_dir = data_dir / "runs"
     browser_state_dir = data_dir / "browser_state"
     exports_dir = root / "exports"
+    media_dir = Path(os.getenv("SCRAPED_MEDIA_DIR", str(root / "Output")))
     sqlite_path = data_dir / "state.sqlite3"
 
-    for p in (data_dir, runs_dir, browser_state_dir, exports_dir):
+    for p in (data_dir, runs_dir, browser_state_dir, exports_dir, media_dir):
         p.mkdir(parents=True, exist_ok=True)
 
     proxy_pool = _parse_proxy_pool(os.getenv("PROXY_POOL_JSON", "[]"))
@@ -95,6 +179,11 @@ def load_settings() -> Settings:
     browser_headless = headless_raw in {"1", "true", "yes", "on"}
     clone_raw = os.getenv("BRAVE_CLONE_PROFILE_WHEN_RUNNING", "1").strip().lower()
     brave_clone_profile_when_running = clone_raw in {"1", "true", "yes", "on"}
+    sample_mode_raw = os.getenv("SAMPLE_COLLECTION_MODE", "1").strip().lower()
+    sample_collection_mode = sample_mode_raw in {"1", "true", "yes", "on"}
+
+    brave_executable_path = _auto_detect_brave_executable_path()
+    brave_user_data_dir = _auto_detect_brave_user_data_dir()
 
     return Settings(
         app_name="insta-scraper",
@@ -104,9 +193,10 @@ def load_settings() -> Settings:
         runs_dir=runs_dir,
         browser_state_dir=browser_state_dir,
         exports_dir=exports_dir,
+        media_dir=media_dir,
         sqlite_path=sqlite_path,
-        brave_executable_path=os.getenv("BRAVE_EXECUTABLE_PATH"),
-        brave_user_data_dir=os.getenv("BRAVE_USER_DATA_DIR"),
+        brave_executable_path=brave_executable_path,
+        brave_user_data_dir=brave_user_data_dir,
         brave_profile_directory=os.getenv("BRAVE_PROFILE_DIRECTORY", "Default"),
         brave_clone_profile_when_running=brave_clone_profile_when_running,
         browser_headless=browser_headless,
@@ -120,6 +210,16 @@ def load_settings() -> Settings:
         request_timeout_seconds=int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")),
         retry_max_attempts=int(os.getenv("RETRY_MAX_ATTEMPTS", "3")),
         retry_base_delay_seconds=float(os.getenv("RETRY_BASE_DELAY_SECONDS", "2.0")),
+        challenge_auto_retry_attempts=int(
+            os.getenv("CHALLENGE_AUTO_RETRY_ATTEMPTS", "3")
+        ),
+        challenge_auto_retry_wait_seconds=float(
+            os.getenv("CHALLENGE_AUTO_RETRY_WAIT_SECONDS", "8.0")
+        ),
+        rate_limit_cooldown_seconds=float(
+            os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "30")
+        ),
+        sample_collection_mode=sample_collection_mode,
         max_posts_per_profile=(
             None
             if int(os.getenv("MAX_POSTS_PER_PROFILE", "0")) <= 0

@@ -3,6 +3,54 @@ from __future__ import annotations
 import re
 
 
+def _is_about_details_text(text: str) -> bool:
+    return bool(
+        re.search(
+            r"date joined|account based in|active ads|verified",
+            text or "",
+            re.IGNORECASE,
+        )
+    )
+
+
+def _extract_about_dialog_text(page: object) -> str:
+    dialogs = page.locator("div[role='dialog']")
+    try:
+        count = dialogs.count()
+    except Exception:
+        count = 0
+
+    best = ""
+    for idx in range(max(0, count - 1), -1, -1):
+        try:
+            text = dialogs.nth(idx).inner_text(timeout=1200)
+        except Exception:
+            continue
+        if _is_about_details_text(text):
+            return text
+        if len(text) > len(best):
+            best = text
+    return best
+
+
+def _click_about_from_menu(page: object) -> bool:
+    candidates = [
+        "[role='menuitem']:has-text('About this account')",
+        "div[role='dialog'] button:has-text('About this account')",
+        "div[role='dialog'] a:has-text('About this account')",
+        "div[role='dialog'] :text('About this account')",
+    ]
+    for selector in candidates:
+        try:
+            page.locator(selector).first.click(timeout=1800)
+            page.wait_for_timeout(700)
+            if _is_about_details_text(_extract_about_dialog_text(page)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _open_about_dialog(page: object) -> bool:
     try:
         direct = page.get_by_text(
@@ -10,10 +58,13 @@ def _open_about_dialog(page: object) -> bool:
         ).first
         if direct.count() > 0:
             direct.click(timeout=1500)
-            return True
+            page.wait_for_timeout(600)
+            if _is_about_details_text(_extract_about_dialog_text(page)):
+                return True
     except Exception:
         pass
 
+    # Open the 3-dots profile menu first.
     button_selectors = [
         "button:has(svg[aria-label='Options'])",
         "button:has(svg[aria-label='More options'])",
@@ -21,31 +72,31 @@ def _open_about_dialog(page: object) -> bool:
         "button[aria-label='More options']",
         "svg[aria-label='Options']",
     ]
-    clicked = False
     for selector in button_selectors:
         try:
             page.locator(selector).first.click(timeout=1500)
-            clicked = True
-            break
+            page.wait_for_timeout(500)
+            if _click_about_from_menu(page):
+                return True
+            try:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
         except Exception:
             continue
-    if not clicked:
-        return False
-    try:
-        page.get_by_role(
-            "menuitem", name=re.compile(r"about this account", re.IGNORECASE)
-        ).first.click(timeout=2000)
-        return True
-    except Exception:
-        pass
 
+    # Last attempt: if about text is visible now, click it once more.
     try:
         page.get_by_text(re.compile(r"about this account", re.IGNORECASE)).first.click(
-            timeout=2000
+            timeout=1500
         )
-        return True
+        page.wait_for_timeout(600)
+        if _is_about_details_text(_extract_about_dialog_text(page)):
+            return True
     except Exception:
-        return False
+        pass
+    return False
 
 
 def _extract_by_label(text: str, label: str) -> str | None:
@@ -74,35 +125,66 @@ def _extract_following_line(text: str, labels: list[str]) -> str | None:
             candidate = lines[j]
             if label_regex.search(candidate):
                 continue
-            if candidate.lower() in {"active ads", "verified", "date joined"}:
+            if candidate.lower() in {
+                "active ads",
+                "verified",
+                "date joined",
+                "account based in",
+            }:
                 continue
             return candidate
+    return None
+
+
+def _extract_ads_library_url(page: object) -> str | None:
+    selectors = ["a[href*='ads/library']", "a[href*='facebook.com/ads/library']"]
+    dialogs = page.locator("div[role='dialog']")
+    try:
+        count = dialogs.count()
+    except Exception:
+        count = 0
+
+    for idx in range(max(0, count - 1), -1, -1):
+        dialog = dialogs.nth(idx)
+        for selector in selectors:
+            try:
+                href = dialog.locator(selector).first.get_attribute(
+                    "href", timeout=1200
+                )
+            except Exception:
+                href = None
+            if href:
+                return href
     return None
 
 
 def scrape_about_section(page: object) -> dict:
     default = {
         "date_joined": None,
+        "account_based_in": None,
         "active_ads_status": None,
+        "active_ads_url": None,
         "time_verified": None,
     }
     opened = _open_about_dialog(page)
     if not opened:
         return default
 
-    try:
-        modal_text = page.locator("div[role='dialog']").first.inner_text(timeout=2500)
-    except Exception:
-        modal_text = ""
+    modal_text = _extract_about_dialog_text(page)
 
     date_joined = _extract_by_label(
         modal_text, "Date joined"
     ) or _extract_following_line(modal_text, ["Date joined", "Joined"])
+    account_based_in = _extract_by_label(
+        modal_text, "Account based in"
+    ) or _extract_following_line(modal_text, ["Account based in", "Based in"])
     time_verified = _extract_by_label(
         modal_text, "Verified"
     ) or _extract_following_line(
         modal_text, ["Time verified", "Date verified", "Verified"]
     )
+
+    active_ads_url = _extract_ads_library_url(page)
 
     active_ads_status: str | None
     if re.search(r"active ads|running ads", modal_text, re.IGNORECASE):
@@ -120,6 +202,8 @@ def scrape_about_section(page: object) -> dict:
 
     return {
         "date_joined": date_joined,
+        "account_based_in": account_based_in,
         "active_ads_status": active_ads_status,
+        "active_ads_url": active_ads_url,
         "time_verified": time_verified,
     }

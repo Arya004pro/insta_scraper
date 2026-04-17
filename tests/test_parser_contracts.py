@@ -1,6 +1,7 @@
-from app.collectors.about_scraper import _extract_by_label
+from app.collectors.about_scraper import _extract_by_label, _extract_following_line
 from app.collectors.grid_enumerator import extract_media_links_from_html
 from app.collectors.post_detail_scraper import _parse_counts_from_text
+from app.anti_block.challenge_handler import detect_challenge
 from app.collectors.profile_scraper import (
     _parse_counts_from_og_description,
     detect_private_profile_from_text,
@@ -14,6 +15,8 @@ PROFILE_PRIVATE_HTML = """
 ABOUT_SNAPSHOT_TEXT = """
 Date joined
 January 2020
+Account based in
+India
 This account has active ads
 Verified
 March 2021
@@ -42,6 +45,10 @@ def test_profile_private_parser_contract():
 def test_about_parser_contract():
     assert _extract_by_label(ABOUT_SNAPSHOT_TEXT, "Date joined") == "January 2020"
     assert _extract_by_label(ABOUT_SNAPSHOT_TEXT, "Verified") == "March 2021"
+    assert (
+        _extract_following_line(ABOUT_SNAPSHOT_TEXT, ["Account based in", "Based in"])
+        == "India"
+    )
 
 
 def test_grid_parser_contract():
@@ -67,3 +74,37 @@ def test_profile_og_count_parser_contract():
     assert out["followers_count"] == 1_000_000
     assert out["following_count"] == 2
     assert out["total_posts_count"] == 710
+
+
+class _MockPage429:
+    url = "https://www.instagram.com/reel/ABC123/"
+
+    def inner_text(self, selector: str, timeout: int = 0) -> str:
+        _ = selector
+        _ = timeout
+        return "This page isn't working HTTP ERROR 429"
+
+    def title(self) -> str:
+        return "www.instagram.com"
+
+    def locator(self, selector: str):
+        _ = selector
+
+        class _Noop:
+            def count(self) -> int:
+                return 0
+
+        return _Noop()
+
+    def get_by_role(self, *_args, **_kwargs):
+        class _Noop:
+            def count(self) -> int:
+                return 0
+
+        return _Noop()
+
+
+def test_challenge_detector_catches_http_429_page():
+    hit, pattern = detect_challenge(_MockPage429())
+    assert hit is True
+    assert pattern == "http_error_429"

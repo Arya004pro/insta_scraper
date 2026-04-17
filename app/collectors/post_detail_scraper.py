@@ -12,6 +12,29 @@ HASHTAG_RE = re.compile(r"#([A-Za-z0-9_]+)")
 MENTION_RE = re.compile(r"@([A-Za-z0-9._]+)")
 
 
+def _best_src_from_srcset(srcset: str | None) -> str | None:
+    if not srcset:
+        return None
+    best_url = None
+    best_width = -1
+    for chunk in srcset.split(","):
+        part = chunk.strip()
+        if not part:
+            continue
+        pieces = part.split()
+        url = pieces[0]
+        width = 0
+        if len(pieces) > 1 and pieces[1].endswith("w"):
+            try:
+                width = int(pieces[1][:-1])
+            except ValueError:
+                width = 0
+        if width > best_width:
+            best_width = width
+            best_url = url
+    return best_url
+
+
 def _to_int(raw: str | None) -> int | None:
     if not raw:
         return None
@@ -97,6 +120,175 @@ def _extract_location(page: object) -> str | None:
         return None
 
 
+def _extract_media_asset_urls(page: object) -> list[str]:
+    def _collect_visible_article_assets() -> list[str]:
+        out: list[str] = []
+        seen_local: set[str] = set()
+        try:
+            image_nodes = page.locator("article img").all()
+        except Exception:
+            image_nodes = []
+        for node in image_nodes:
+            try:
+                srcset = node.get_attribute("srcset")
+                src = _best_src_from_srcset(srcset) or node.get_attribute("src")
+            except Exception:
+                src = None
+            if not src or not src.startswith("http"):
+                continue
+            if src in seen_local:
+                continue
+            seen_local.add(src)
+            out.append(src)
+
+        try:
+            video_nodes = page.locator(
+                "article video[src], article video source[src]"
+            ).all()
+        except Exception:
+            video_nodes = []
+        for node in video_nodes:
+            try:
+                src = node.get_attribute("src")
+            except Exception:
+                src = None
+            if not src or not src.startswith("http"):
+                continue
+            if src in seen_local:
+                continue
+            seen_local.add(src)
+            out.append(src)
+        return out
+
+    def _click_carousel_next() -> bool:
+        selectors = [
+            "button[aria-label='Next']",
+            "button:has(svg[aria-label='Next'])",
+            "article button[aria-label='Next']",
+        ]
+        for selector in selectors:
+            try:
+                btn = page.locator(selector).first
+                if btn.count() > 0:
+                    btn.click(timeout=900)
+                    return True
+            except Exception:
+                continue
+        try:
+            btn = page.get_by_role(
+                "button", name=re.compile(r"^next$", re.IGNORECASE)
+            ).first
+            if btn.count() > 0:
+                btn.click(timeout=900)
+                return True
+        except Exception:
+            pass
+        return False
+
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    for src in _collect_visible_article_assets():
+        if src not in seen:
+            seen.add(src)
+            urls.append(src)
+
+    # Traverse carousel cards to collect all media URLs when present.
+    for _ in range(10):
+        if not _click_carousel_next():
+            break
+        page.wait_for_timeout(350)
+        added = 0
+        for src in _collect_visible_article_assets():
+            if src in seen:
+                continue
+            seen.add(src)
+            urls.append(src)
+            added += 1
+        if added == 0:
+            break
+
+    if urls:
+        return urls
+
+    # Single media posts often expose a usable fallback via OG tags.
+    for selector in [
+        "meta[property='og:image']",
+        "meta[property='og:video']",
+    ]:
+        try:
+            content = page.locator(selector).first.get_attribute("content", timeout=800)
+        except Exception:
+            content = None
+        if content and content.startswith("http") and content not in seen:
+            seen.add(content)
+            urls.append(content)
+    return urls
+
+
+def _extract_reel_video_urls(page: object) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    for selector in [
+        "meta[property='og:video']",
+        "meta[property='og:video:url']",
+        "video[src]",
+        "video source[src]",
+    ]:
+        try:
+            nodes = page.locator(selector).all()
+        except Exception:
+            nodes = []
+        for node in nodes:
+            try:
+                src = node.get_attribute("content") or node.get_attribute("src")
+            except Exception:
+                src = None
+            if not src or not src.startswith("http"):
+                continue
+            if src in seen:
+                continue
+            seen.add(src)
+            urls.append(src)
+
+    try:
+        html = page.content()
+    except Exception:
+        html = ""
+
+    if html:
+        for raw in re.findall(r'"video_url":"(https:[^"]+)"', html):
+            decoded = raw.replace("\\/", "/").replace("\\u0026", "&")
+            if decoded not in seen:
+                seen.add(decoded)
+                urls.append(decoded)
+
+        for raw in re.findall(
+            r'"video_versions":\[\{"type":\d+,"url":"(https:[^"]+)"', html
+        ):
+            decoded = raw.replace("\\/", "/").replace("\\u0026", "&")
+            if decoded not in seen:
+                seen.add(decoded)
+                urls.append(decoded)
+
+        # Sometimes JSON-LD contains contentUrl for videos.
+        for raw in re.findall(r'"contentUrl"\s*:\s*"(https:[^"]+)"', html):
+            decoded = raw.replace("\\/", "/").replace("\\u0026", "&")
+            if decoded not in seen:
+                seen.add(decoded)
+                urls.append(decoded)
+
+    # Guardrail: keep only URLs that look like video payloads for reels.
+    filtered = []
+    for url in urls:
+        lower = url.lower()
+        if ".mp4" in lower or "video" in lower:
+            filtered.append(url)
+
+    return filtered or urls
+
+
 def _extract_keywords(caption: str | None) -> str | None:
     if not caption:
         return None
@@ -142,6 +334,20 @@ def scrape_post_detail(
                 media_type = "video_post"
         except Exception:
             pass
+
+    if media_type == "reel":
+        media_asset_urls = _extract_reel_video_urls(page)
+    else:
+        media_asset_urls = _extract_media_asset_urls(page)
+
+    if media_type != "reel" and len(media_asset_urls) > 1:
+        media_type = "carousel_post"
+
+    if media_type == "reel" and media_asset_urls:
+        # Reels should always prefer actual video URLs over thumbnails.
+        media_asset_urls = [
+            u for u in media_asset_urls if ".mp4" in u.lower() or "video" in u.lower()
+        ] or media_asset_urls
 
     caption = _extract_caption(page)
     og_description = _extract_og_description(page)
@@ -189,5 +395,6 @@ def scrape_post_detail(
         "mentions_csv": ",".join(sorted(set(mentions))) if mentions else None,
         "caption_text": caption,
         "location_name": _extract_location(page),
+        "media_asset_urls": media_asset_urls,
         "missing_reason_post": missing_reason,
     }

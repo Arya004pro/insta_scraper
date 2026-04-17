@@ -28,6 +28,8 @@ pip-wheel-metadata/
 # Runtime data and local state (sensitive/noisy)
 data/
 exports/
+scraped_media/
+Output/
 *.sqlite3
 *.db
 *.log

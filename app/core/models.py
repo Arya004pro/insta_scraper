@@ -47,7 +47,9 @@ PROFILE_COLUMNS = [
     "highlight_reel_count",
     "total_posts_count",
     "date_joined",
+    "account_based_in",
     "active_ads_status",
+    "active_ads_url",
     "time_verified",
     "is_verified",
     "is_private",
@@ -99,6 +101,9 @@ POSTS_COLUMNS = [
     "mentions_csv",
     "caption_text",
     "location_name",
+    "media_asset_urls_csv",
+    "media_asset_local_paths_csv",
+    "sample_bucket",
     "missing_reason_post",
 ]
 
@@ -218,6 +223,9 @@ class PostRecord(BaseModel):
     mentions_csv: str | None = None
     caption_text: str | None = None
     location_name: str | None = None
+    media_asset_urls_csv: str | None = None
+    media_asset_local_paths_csv: str | None = None
+    sample_bucket: str | None = None
     missing_reason_post: str | None = None
 
     def to_row(self) -> dict[str, Any]:
@@ -237,7 +245,9 @@ class ProfileRecord(BaseModel):
     highlight_reel_count: int | None = None
     total_posts_count: int | None = None
     date_joined: str | None = None
+    account_based_in: str | None = None
     active_ads_status: str | None = None
+    active_ads_url: str | None = None
     time_verified: str | None = None
     is_verified: bool | None = None
     is_private: bool | None = None

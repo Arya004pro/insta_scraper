@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import csv
+import mimetypes
 import os
+import random
+import re
 import shutil
 import subprocess
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-from app.anti_block.challenge_handler import detect_challenge
+import requests
+
+from app.anti_block.challenge_handler import collect_page_diagnostics, detect_challenge
 from app.anti_block.proxy_manager import ProxyManager
 from app.anti_block.session_manager import SessionManager
 from app.collectors.about_scraper import scrape_about_section
@@ -21,6 +27,7 @@ from app.collectors.highlight_scraper import scrape_highlights
 from app.collectors.link_expander import expand_external_links
 from app.collectors.post_detail_scraper import scrape_post_detail
 from app.collectors.profile_scraper import scrape_profile_header
+from app.collectors.timeline_snapshot import collect_recent_timeline_items
 from app.core.config import Settings, iso_ist, now_ist
 from app.core.models import (
     AGGREGATES_COLUMNS,
@@ -34,7 +41,6 @@ from app.core.models import (
 )
 from app.core.url_validator import InvalidInstagramUrl, normalize_instagram_profile_url
 from app.exporters.csv_exporter import export_csv_artifacts
-from app.exporters.xlsx_exporter import export_xlsx_artifacts
 from app.metrics.aggregator import build_aggregates, build_summary_flat
 from app.storage.sqlite_store import SQLiteStore
 
@@ -439,6 +445,151 @@ class RunOrchestrator:
         )
         return any(n in text for n in needles)
 
+    def _is_rate_limited_error(self, exc: Exception, page: object) -> bool:
+        text = str(exc).lower()
+        if any(
+            needle in text
+            for needle in (
+                "err_http_response_code_failure",
+                "http error 429",
+                "too many requests",
+                "temporarily blocked",
+            )
+        ):
+            return True
+        try:
+            diagnostics = collect_page_diagnostics(page)
+            return diagnostics.get("http_error_code") == "429"
+        except Exception:
+            return False
+
+    def _sample_bucket_for_media_type(self, media_type: str | None) -> str | None:
+        if media_type == "reel":
+            return "reels"
+        if media_type == "carousel_post":
+            return "multi_image_posts"
+        if media_type in {"image_post", "video_post"}:
+            return "posts"
+        return None
+
+    def _profile_media_folder_name(
+        self, username: str, full_name: str | None = None
+    ) -> str:
+        base = (full_name or username or "unknown_profile").strip().lower()
+        safe = "".join(ch if ch.isalnum() else "_" for ch in base)
+        safe = re.sub(r"_+", "_", safe).strip("_")
+        return safe or "unknown_profile"
+
+    def _guess_asset_extension(self, url: str, content_type: str | None = None) -> str:
+        parsed = urlparse(url)
+        suffix = Path(parsed.path).suffix.lower()
+        if suffix in {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v"}:
+            return suffix
+        if content_type:
+            guessed = mimetypes.guess_extension(content_type.split(";")[0].strip())
+            if guessed:
+                return guessed
+        guess, _ = mimetypes.guess_type(url)
+        if guess:
+            ext = mimetypes.guess_extension(guess)
+            if ext:
+                return ext
+        return ".bin"
+
+    def _download_sample_media_assets(
+        self,
+        run_id: str,
+        username: str,
+        full_name: str | None,
+        sample_bucket: str,
+        shortcode: str,
+        media_asset_urls: list[str],
+    ) -> list[str]:
+        if not media_asset_urls:
+            return []
+
+        profile_dir_name = self._profile_media_folder_name(username, full_name)
+        base_dir = self.settings.media_dir / profile_dir_name / sample_bucket
+        base_dir.mkdir(parents=True, exist_ok=True)
+        saved_paths: list[str] = []
+        ts = now_ist().strftime("%Y-%m-%d_%H-%M-%S")
+        run_short = run_id[:8]
+
+        for idx, asset_url in enumerate(media_asset_urls, start=1):
+            try:
+                response = requests.get(
+                    asset_url,
+                    timeout=self.settings.request_timeout_seconds,
+                    stream=True,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                response.raise_for_status()
+
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                ext = self._guess_asset_extension(asset_url, content_type)
+
+                is_video = content_type.startswith("video/") or ext in {
+                    ".mp4",
+                    ".mov",
+                    ".m4v",
+                    ".webm",
+                }
+                if sample_bucket == "reels" and not is_video:
+                    continue
+
+                out_path = base_dir / f"{ts}_{run_short}_{shortcode}_{idx:02d}{ext}"
+                with out_path.open("wb") as f:
+                    for chunk in response.iter_content(chunk_size=64 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                saved_paths.append(str(out_path.resolve()))
+            except Exception:
+                continue
+
+        return saved_paths
+
+    def _append_sample_manifest(
+        self,
+        username: str,
+        full_name: str | None,
+        sample_bucket: str,
+        shortcode: str,
+        post_url: str,
+        media_asset_urls: list[str],
+        media_asset_local_paths: list[str],
+    ) -> None:
+        profile_dir_name = self._profile_media_folder_name(username, full_name)
+        profile_root = self.settings.media_dir / profile_dir_name
+        profile_root.mkdir(parents=True, exist_ok=True)
+        manifest_path = profile_root / "sample_index.csv"
+        columns = [
+            "captured_at_ist",
+            "sample_type",
+            "shortcode",
+            "post_url",
+            "remote_asset_urls_csv",
+            "local_asset_paths_csv",
+        ]
+        row = {
+            "captured_at_ist": iso_ist(now_ist()),
+            "sample_type": sample_bucket,
+            "shortcode": shortcode,
+            "post_url": post_url,
+            "remote_asset_urls_csv": ",".join(media_asset_urls)
+            if media_asset_urls
+            else None,
+            "local_asset_paths_csv": ",".join(media_asset_local_paths)
+            if media_asset_local_paths
+            else None,
+        }
+
+        exists = manifest_path.exists()
+        with manifest_path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=columns)
+            if not exists:
+                writer.writeheader()
+            writer.writerow(row)
+
     def _scrape_single_profile(
         self,
         run_id: str,
@@ -461,6 +612,100 @@ class RunOrchestrator:
         if proxy:
             self.store.update_run(run_id, proxy_id=proxy.proxy_id)
         self.store.add_event(run_id, f"Browser started for {profile_url}")
+
+        def _save_page_debug_artifacts(stage: str) -> dict[str, str | None]:
+            debug_dir = self.settings.runs_dir / run_id / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            safe_stage = re.sub(r"[^a-zA-Z0-9._-]+", "_", stage).strip("_") or "stage"
+            stamp = now_ist().strftime("%Y%m%d_%H%M%S_%f")
+            html_path = debug_dir / f"{safe_stage}_{stamp}.html"
+            screenshot_path = debug_dir / f"{safe_stage}_{stamp}.png"
+
+            try:
+                html = page.content()
+                html_path.write_text(html, encoding="utf-8")
+            except Exception:
+                html_path = None
+
+            try:
+                page.screenshot(path=str(screenshot_path), full_page=True)
+            except Exception:
+                screenshot_path = None
+
+            return {
+                "html_path": str(html_path.resolve()) if html_path else None,
+                "screenshot_path": str(screenshot_path.resolve())
+                if screenshot_path
+                else None,
+            }
+
+        def _log_problem_diagnostics(stage: str, reason: str) -> None:
+            diag = collect_page_diagnostics(page)
+            artifacts = _save_page_debug_artifacts(stage)
+            message = (
+                f"Diagnostics [{stage}] reason={reason}; "
+                f"url={diag.get('url')}; title={diag.get('title')}; "
+                f"http_error={diag.get('http_error_code')}; "
+                f"body_snippet={diag.get('body_snippet')}; "
+                f"html={artifacts.get('html_path')}; screenshot={artifacts.get('screenshot_path')}"
+            )
+            self.store.add_event(run_id, message, level="warning")
+
+        def _check_challenge_with_recovery(
+            state: dict[str, Any],
+            recovery_url: str | None = None,
+        ) -> bool:
+            hit, pattern = detect_challenge(page)
+            if not hit:
+                return True
+
+            _log_problem_diagnostics(
+                stage=str(state.get("stage") or "challenge"),
+                reason=f"challenge_detected:{pattern}",
+            )
+
+            attempts = max(0, self.settings.challenge_auto_retry_attempts)
+            for attempt in range(1, attempts + 1):
+                self.store.add_event(
+                    run_id,
+                    f"Challenge detected ({pattern}). Auto-recovery attempt {attempt}/{attempts}",
+                    level="warning",
+                )
+                wait_seconds = self.settings.challenge_auto_retry_wait_seconds
+                if wait_seconds > 0:
+                    time.sleep(wait_seconds)
+
+                try:
+                    _relaunch_browser_session(
+                        "Relaunching browser session for challenge auto-recovery"
+                    )
+                    if recovery_url:
+                        page.goto(recovery_url, wait_until="domcontentloaded")
+                        page.wait_for_timeout(
+                            max(500, self.settings.post_detail_wait_ms)
+                        )
+                except Exception:
+                    pass
+
+                hit, pattern = detect_challenge(page)
+                if not hit:
+                    self.store.add_event(
+                        run_id,
+                        "Challenge auto-recovery succeeded; continuing run.",
+                    )
+                    return True
+
+            self.store.add_event(
+                run_id,
+                f"Challenge persisted after auto-recovery ({pattern}); continuing with partial data.",
+                level="warning",
+            )
+            _log_problem_diagnostics(
+                stage=str(state.get("stage") or "challenge_persisted"),
+                reason=f"challenge_persisted:{pattern}",
+            )
+            self.store.update_run(run_id, challenge_encountered=True)
+            return False
 
         def _relaunch_browser_session(reason: str) -> None:
             nonlocal playwright, context, page, temp_profile_dir
@@ -491,8 +736,9 @@ class RunOrchestrator:
 
         try:
             profile = scrape_profile_header(page, profile_url)
-            self._check_challenge_or_raise(
-                page, run_id, {"stage": "profile_header", "profile_url": profile_url}
+            profile_challenge_cleared = _check_challenge_with_recovery(
+                {"stage": "profile_header", "profile_url": profile_url},
+                recovery_url=profile_url,
             )
 
             scraped_at = iso_ist(now_ist())
@@ -501,6 +747,17 @@ class RunOrchestrator:
                 "run_id": run_id,
                 **profile.profile_data,
             }
+
+            if not profile_challenge_cleared:
+                profile_row["missing_reason_profile"] = "challenge_blocked"
+                return ProfileRunResult(
+                    profile_row={k: profile_row.get(k) for k in PROFILE_COLUMNS},
+                    highlights_rows=[],
+                    links_rows=[],
+                    posts_rows=[],
+                    aggregates_rows=[],
+                    status="completed",
+                )
 
             if profile.is_private:
                 profile_row["missing_reason_profile"] = (
@@ -540,60 +797,195 @@ class RunOrchestrator:
                 for row in links_raw
             ]
 
-            discovered: list[dict[str, Any]] | None = None
-            enum_attempts = 0
-            last_enum_error: Exception | None = None
-            while enum_attempts < self.settings.retry_max_attempts:
-                enum_attempts += 1
-                try:
-                    discovered = enumerate_grid_posts(
-                        page, self.settings, resume_state=resume_state
-                    )
-                    break
-                except Exception as exc:
-                    last_enum_error = exc
-                    if not self._is_closed_context_error(exc):
-                        raise
-                    self.store.add_event(
-                        run_id,
-                        "Browser context closed during grid scan; relaunching and retrying.",
-                        level="warning",
-                    )
-                    _relaunch_browser_session(
-                        "Relaunching browser session after closed context during grid scan"
-                    )
-                    page.goto(profile_url, wait_until="domcontentloaded")
-                    page.wait_for_timeout(max(300, self.settings.post_detail_wait_ms))
-
-            if discovered is None:
-                if last_enum_error is not None:
-                    raise last_enum_error
-                raise RuntimeError("Failed to enumerate posts/reels")
-            if (
-                self.settings.max_posts_per_profile
-                and self.settings.max_posts_per_profile > 0
-            ):
-                discovered = discovered[: self.settings.max_posts_per_profile]
-                self.store.add_event(
-                    run_id,
-                    f"Post discovery limited to first {self.settings.max_posts_per_profile} items",
-                )
-            self.store.add_event(run_id, f"Discovered {len(discovered)} posts/reels")
-            self._check_challenge_or_raise(
-                page,
-                run_id,
-                {
-                    "stage": "grid_enumeration",
-                    "profile_url": profile_url,
-                    "discovered_posts": discovered,
-                },
-            )
-
             processed: set[str] = set(resume_state.get("processed_shortcodes", []))
             posts_rows: list[dict[str, Any]] = list(
                 resume_state.get("partial_posts_rows", [])
             )
             username = profile_row.get("username") or username_hint
+            sample_captured = {
+                "posts": False,
+                "reels": False,
+                "multi_image_posts": False,
+            }
+            required_samples = {"posts", "reels", "multi_image_posts"}
+            consecutive_rate_limits = 0
+            stop_post_loop_due_rate_limit = False
+
+            for row in posts_rows:
+                bucket = row.get("sample_bucket")
+                if bucket in sample_captured:
+                    sample_captured[bucket] = True
+
+            discovered: list[dict[str, Any]] = []
+            if self.settings.sample_collection_mode:
+                self.store.add_event(
+                    run_id,
+                    "Sample mode enabled: collecting timeline snapshot first to avoid deep scrolling.",
+                )
+                timeline_items: list[dict[str, Any]] = []
+                try:
+                    timeline_items = collect_recent_timeline_items(
+                        page,
+                        profile_url,
+                        wait_ms=max(1500, self.settings.post_detail_wait_ms * 4),
+                    )
+                except Exception as exc:
+                    self.store.add_event(
+                        run_id,
+                        f"Timeline snapshot unavailable ({type(exc).__name__}). Using visible grid fallback.",
+                        level="warning",
+                    )
+
+                for item in timeline_items:
+                    if all(sample_captured[b] for b in required_samples):
+                        break
+                    shortcode = item.get("shortcode")
+                    if not shortcode or shortcode in processed:
+                        continue
+
+                    sample_bucket = item.get(
+                        "sample_bucket"
+                    ) or self._sample_bucket_for_media_type(item.get("media_type"))
+                    if sample_bucket not in sample_captured or sample_captured.get(
+                        sample_bucket
+                    ):
+                        continue
+
+                    media_asset_urls = [
+                        x
+                        for x in (item.get("media_asset_urls") or [])
+                        if isinstance(x, str) and x
+                    ]
+                    if not media_asset_urls:
+                        continue
+
+                    media_asset_local_paths = self._download_sample_media_assets(
+                        run_id=run_id,
+                        username=username,
+                        full_name=profile_row.get("full_name"),
+                        sample_bucket=sample_bucket,
+                        shortcode=shortcode,
+                        media_asset_urls=media_asset_urls,
+                    )
+                    if media_asset_local_paths:
+                        self._append_sample_manifest(
+                            username=username,
+                            full_name=profile_row.get("full_name"),
+                            sample_bucket=sample_bucket,
+                            shortcode=shortcode,
+                            post_url=item.get("post_url") or "",
+                            media_asset_urls=media_asset_urls,
+                            media_asset_local_paths=media_asset_local_paths,
+                        )
+
+                    row = {
+                        "scraped_at_ist": scraped_at,
+                        "run_id": run_id,
+                        "username": username,
+                        "shortcode": shortcode,
+                        "post_url": item.get("post_url"),
+                        "media_type": item.get("media_type"),
+                        "posted_at_ist": item.get("posted_at_ist"),
+                        "likes_count": item.get("likes_count"),
+                        "comments_count": item.get("comments_count"),
+                        "views_count": item.get("views_count"),
+                        "is_remix_repost": item.get("is_remix_repost"),
+                        "is_tagged_post": item.get("is_tagged_post"),
+                        "tagged_users_count": item.get("tagged_users_count"),
+                        "hashtags_csv": item.get("hashtags_csv"),
+                        "keywords_csv": item.get("keywords_csv"),
+                        "mentions_csv": item.get("mentions_csv"),
+                        "caption_text": item.get("caption_text"),
+                        "location_name": item.get("location_name"),
+                        "media_asset_urls_csv": ",".join(media_asset_urls),
+                        "media_asset_local_paths_csv": ",".join(media_asset_local_paths)
+                        if media_asset_local_paths
+                        else None,
+                        "sample_bucket": sample_bucket,
+                        "missing_reason_post": None,
+                    }
+                    posts_rows.append({k: row.get(k) for k in POSTS_COLUMNS})
+                    processed.add(shortcode)
+                    sample_captured[sample_bucket] = True
+                    self.store.add_event(
+                        run_id,
+                        f"Sample captured from timeline: {sample_bucket} ({shortcode})",
+                    )
+
+                if not all(sample_captured[b] for b in required_samples):
+                    self.store.add_event(
+                        run_id,
+                        "Sample mode fallback: scanning only currently visible grid posts (no deep scroll).",
+                        level="warning",
+                    )
+                    visible_scan_settings = replace(self.settings, scroll_idle_rounds=0)
+                    discovered = enumerate_grid_posts(
+                        page, visible_scan_settings, resume_state=resume_state
+                    )
+                    if (
+                        self.settings.max_posts_per_profile
+                        and self.settings.max_posts_per_profile > 0
+                    ):
+                        discovered = discovered[: self.settings.max_posts_per_profile]
+                    else:
+                        discovered = discovered[:30]
+                else:
+                    discovered = []
+            else:
+                enum_attempts = 0
+                last_enum_error: Exception | None = None
+                discovered_or_none: list[dict[str, Any]] | None = None
+                while enum_attempts < self.settings.retry_max_attempts:
+                    enum_attempts += 1
+                    try:
+                        discovered_or_none = enumerate_grid_posts(
+                            page, self.settings, resume_state=resume_state
+                        )
+                        break
+                    except Exception as exc:
+                        last_enum_error = exc
+                        if not self._is_closed_context_error(exc):
+                            raise
+                        self.store.add_event(
+                            run_id,
+                            "Browser context closed during grid scan; relaunching and retrying.",
+                            level="warning",
+                        )
+                        _relaunch_browser_session(
+                            "Relaunching browser session after closed context during grid scan"
+                        )
+                        page.goto(profile_url, wait_until="domcontentloaded")
+                        page.wait_for_timeout(
+                            max(300, self.settings.post_detail_wait_ms)
+                        )
+
+                if discovered_or_none is None:
+                    if last_enum_error is not None:
+                        raise last_enum_error
+                    raise RuntimeError("Failed to enumerate posts/reels")
+                discovered = discovered_or_none
+
+                if (
+                    self.settings.max_posts_per_profile
+                    and self.settings.max_posts_per_profile > 0
+                ):
+                    discovered = discovered[: self.settings.max_posts_per_profile]
+                    self.store.add_event(
+                        run_id,
+                        f"Post discovery limited to first {self.settings.max_posts_per_profile} items",
+                    )
+
+            self.store.add_event(run_id, f"Discovered {len(discovered)} posts/reels")
+            grid_challenge_cleared = _check_challenge_with_recovery(
+                {
+                    "stage": "grid_enumeration",
+                    "profile_url": profile_url,
+                    "discovered_posts": discovered,
+                },
+                recovery_url=profile_url,
+            )
+            if not grid_challenge_cleared:
+                discovered = []
 
             for i, post in enumerate(discovered):
                 shortcode = post.get("shortcode")
@@ -629,9 +1021,7 @@ class RunOrchestrator:
                             media_type_hint=post.get("media_type_hint"),
                             page_settle_ms=self.settings.post_detail_wait_ms,
                         )
-                        self._check_challenge_or_raise(
-                            page,
-                            run_id,
+                        post_challenge_cleared = _check_challenge_with_recovery(
                             {
                                 "stage": "post_detail",
                                 "profile_url": profile_url,
@@ -641,15 +1031,67 @@ class RunOrchestrator:
                                 "current_post_shortcode": shortcode,
                                 "current_post_index": i,
                             },
+                            recovery_url=post["post_url"],
                         )
+                        if not post_challenge_cleared:
+                            raise RuntimeError("challenge_persisted")
+
+                        media_asset_urls = list(detail.get("media_asset_urls") or [])
+                        sample_bucket = self._sample_bucket_for_media_type(
+                            detail.get("media_type")
+                        )
+                        media_asset_local_paths: list[str] = []
+                        if (
+                            sample_bucket
+                            and not sample_captured[sample_bucket]
+                            and media_asset_urls
+                        ):
+                            media_asset_local_paths = (
+                                self._download_sample_media_assets(
+                                    run_id=run_id,
+                                    username=username,
+                                    full_name=profile_row.get("full_name"),
+                                    sample_bucket=sample_bucket,
+                                    shortcode=shortcode,
+                                    media_asset_urls=media_asset_urls,
+                                )
+                            )
+                            if media_asset_local_paths:
+                                sample_captured[sample_bucket] = True
+                                self.store.add_event(
+                                    run_id,
+                                    f"Stored {len(media_asset_local_paths)} files for {sample_bucket} ({shortcode})",
+                                )
+                                self._append_sample_manifest(
+                                    username=username,
+                                    full_name=profile_row.get("full_name"),
+                                    sample_bucket=sample_bucket,
+                                    shortcode=shortcode,
+                                    post_url=post.get("post_url")
+                                    or detail.get("post_url")
+                                    or "",
+                                    media_asset_urls=media_asset_urls,
+                                    media_asset_local_paths=media_asset_local_paths,
+                                )
+
                         row = {
                             "scraped_at_ist": scraped_at,
                             "run_id": run_id,
                             "username": username,
                             **detail,
+                            "media_asset_urls_csv": ",".join(media_asset_urls)
+                            if media_asset_urls
+                            else None,
+                            "media_asset_local_paths_csv": ",".join(
+                                media_asset_local_paths
+                            )
+                            if media_asset_local_paths
+                            else None,
+                            "sample_bucket": sample_bucket,
                         }
                         posts_rows.append({k: row.get(k) for k in POSTS_COLUMNS})
                         processed.add(shortcode)
+                        consecutive_rate_limits = 0
                         self.store.update_run(
                             run_id,
                             state={
@@ -663,11 +1105,67 @@ class RunOrchestrator:
                                 }
                             },
                         )
+                        if self.settings.sample_collection_mode and all(
+                            sample_captured[b] for b in required_samples
+                        ):
+                            self.store.add_event(
+                                run_id,
+                                "Sample collection mode: captured posts/reels/multi_image_posts; stopping early.",
+                            )
+                            break
                         break
-                    except ChallengeRequired:
-                        raise
                     except Exception as exc:
                         last_error = exc
+                        is_rate_limited = self._is_rate_limited_error(exc, page)
+                        if is_rate_limited:
+                            consecutive_rate_limits += 1
+                            cooldown = max(
+                                1.0,
+                                self.settings.rate_limit_cooldown_seconds * attempts,
+                            )
+                            jitter = random.uniform(0.15, 0.45) * cooldown
+                            cooldown = cooldown + jitter
+                            self.store.add_event(
+                                run_id,
+                                f"Rate limit detected on post {i + 1}. Cooling down {cooldown:.0f}s before retry.",
+                                level="warning",
+                            )
+                            _log_problem_diagnostics(
+                                stage=f"post_detail_{i + 1}",
+                                reason=f"rate_limit:{type(exc).__name__}:{exc}",
+                            )
+
+                            rotated_proxy = proxy_manager.rotate_now()
+                            if rotated_proxy:
+                                self.store.add_event(
+                                    run_id,
+                                    f"Rate limit response: rotating proxy to {rotated_proxy.proxy_id}",
+                                    level="warning",
+                                )
+
+                            time.sleep(cooldown)
+                            _relaunch_browser_session(
+                                f"Relaunching browser session after rate-limit cooldown on post {i + 1}"
+                            )
+
+                            # Prevent hammering Instagram when the account/session is hard-limited.
+                            if (
+                                consecutive_rate_limits >= 3
+                                and not self.settings.has_proxy_pool
+                            ):
+                                self.store.add_event(
+                                    run_id,
+                                    "Repeated rate limits detected without proxy pool; pausing post loop to avoid further blocking.",
+                                    level="warning",
+                                )
+                                stop_post_loop_due_rate_limit = True
+                                break
+                            continue
+                        if attempts == self.settings.retry_max_attempts:
+                            _log_problem_diagnostics(
+                                stage=f"post_detail_{i + 1}",
+                                reason=f"exception:{type(exc).__name__}:{exc}",
+                            )
                         if self._is_closed_context_error(exc):
                             _relaunch_browser_session(
                                 f"Browser context closed while scraping post {i + 1}; retrying in fresh session"
@@ -704,6 +1202,14 @@ class RunOrchestrator:
                         }
                     )
                     processed.add(shortcode)
+
+                if self.settings.sample_collection_mode and all(
+                    sample_captured[b] for b in required_samples
+                ):
+                    break
+
+                if stop_post_loop_due_rate_limit:
+                    break
 
             aggregates_rows = build_aggregates(
                 scraped_at_ist=scraped_at,
@@ -806,19 +1312,6 @@ class RunOrchestrator:
         artifacts = {}
         artifacts.update(
             export_csv_artifacts(
-                exports_dir=self.settings.exports_dir,
-                base_name=base_name,
-                run_log_rows=run_log_rows,
-                profile_rows=profile_rows,
-                highlights_rows=highlights_rows,
-                external_links_rows=external_links_rows,
-                posts_rows=posts_rows,
-                aggregate_rows=aggregate_rows,
-                summary_flat_rows=summary_flat_rows,
-            )
-        )
-        artifacts.update(
-            export_xlsx_artifacts(
                 exports_dir=self.settings.exports_dir,
                 base_name=base_name,
                 run_log_rows=run_log_rows,
