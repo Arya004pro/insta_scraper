@@ -98,6 +98,42 @@
       padding: 10px;
       background: #102030;
     }
+    .output-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .output-card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      background: #0f1e2c;
+    }
+    .preview-wrap {
+      margin: 8px 0;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #0b1620;
+    }
+    .preview-media {
+      display: block;
+      width: 100%;
+      max-height: 240px;
+      object-fit: cover;
+      background: #0b1620;
+    }
+    .pill {
+      display: inline-block;
+      padding: 3px 8px;
+      margin-right: 6px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.2;
+    }
     .muted { color: var(--muted); }
     ul { margin: 6px 0 0 16px; padding: 0; }
   </style>
@@ -135,6 +171,11 @@
       </section>
 
       <section class="card">
+        <h3 style="margin:0 0 8px;">All Captured Outputs</h3>
+        <div id="outputBox" class="small">No output rows yet.</div>
+      </section>
+
+      <section class="card">
         <h3 style="margin:0 0 8px;">Artifacts</h3>
         <div id="artifactBox" class="small">No artifacts yet.</div>
       </section>
@@ -150,6 +191,7 @@
     const errorTextEl = document.getElementById("errorText");
     const profileBox = document.getElementById("profileBox");
     const sampleBox = document.getElementById("sampleBox");
+    const outputBox = document.getElementById("outputBox");
     const artifactBox = document.getElementById("artifactBox");
 
     let pollTimer = null;
@@ -245,6 +287,7 @@
 
       renderProfile(data.profile);
       renderSamples(data.samples || {});
+      renderOutputs(data.outputs || {});
       renderArtifacts(data.artifacts || {});
     }
 
@@ -298,6 +341,94 @@
           ${renderSampleCard("Multi Image Post", samples.multi_image_post)}
           ${renderSampleCard("Reel", samples.reel)}
         </div>
+      `;
+    }
+
+    function pickPreviewUrl(item) {
+      const localUrls = item.media_asset_local_urls || [];
+      const remoteUrls = item.media_asset_urls || [];
+      return localUrls[0] || remoteUrls[0] || null;
+    }
+
+    function renderPreview(url) {
+      if (!url) {
+        return "<div class='small muted'>No media preview available.</div>";
+      }
+      const lower = String(url).toLowerCase();
+      if (/\.(mp4|mov|m4v|webm)(\?|$)/.test(lower)) {
+        return `<div class='preview-wrap'><video class='preview-media' src='${esc(url)}' controls preload='metadata'></video></div>`;
+      }
+      if (/\.(jpg|jpeg|png|webp|gif)(\?|$)/.test(lower)) {
+        return `<div class='preview-wrap'><img class='preview-media' src='${esc(url)}' alt='media preview' loading='lazy'/></div>`;
+      }
+      return `<div class='small'><a href='${esc(url)}' target='_blank'>Open media file</a></div>`;
+    }
+
+    function renderCompactLinks(urls, label, maxCount = 3) {
+      if (!urls || !urls.length) {
+        return `<div class='small muted'>${esc(label)}: none</div>`;
+      }
+      const shown = urls.slice(0, maxCount);
+      const extra = urls.length - shown.length;
+      return `
+        <div class='small'>${esc(label)}:</div>
+        <ul>
+          ${shown.map(u => `<li><a href='${esc(u)}' target='_blank'>${esc(u)}</a></li>`).join("")}
+          ${extra > 0 ? `<li class='muted'>+${extra} more</li>` : ""}
+        </ul>
+      `;
+    }
+
+    function renderOutputCard(item, kindLabel) {
+      const previewUrl = pickPreviewUrl(item);
+      const pills = [
+        `<span class='pill'>${esc(kindLabel)}</span>`,
+        item.media_type ? `<span class='pill'>${esc(item.media_type)}</span>` : "",
+        item.sample_bucket ? `<span class='pill'>${esc(item.sample_bucket)}</span>` : "",
+      ].join("");
+
+      return `
+        <div class='output-card'>
+          <div>${pills}</div>
+          <div style='margin-top:6px;'><a href='${esc(item.post_url || "")}' target='_blank'>${esc(item.post_url || "")}</a></div>
+          ${renderPreview(previewUrl)}
+          <table>
+            <tr><th>Likes</th><td>${esc(item.likes_count || "")}</td></tr>
+            <tr><th>Comments</th><td>${esc(item.comments_count || "")}</td></tr>
+            <tr><th>Views</th><td>${esc(item.views_count || "")}</td></tr>
+            <tr><th>Tagged Users</th><td>${esc(item.tagged_users_count || "")}</td></tr>
+            <tr><th>Hashtags</th><td>${esc(item.hashtags_csv || "")}</td></tr>
+            <tr><th>Keywords</th><td>${esc(item.keywords_csv || "")}</td></tr>
+            <tr><th>Mentions</th><td>${esc(item.mentions_csv || "")}</td></tr>
+            <tr><th>Location</th><td>${esc(item.location_name || "")}</td></tr>
+            <tr><th>Posted At</th><td>${esc(item.posted_at_ist || "")}</td></tr>
+            <tr><th>Caption</th><td>${esc(item.caption_text || "")}</td></tr>
+          </table>
+          ${renderCompactLinks(item.media_asset_local_urls || [], "Local media files")}
+          ${renderCompactLinks(item.media_asset_urls || [], "Remote media URLs")}
+        </div>
+      `;
+    }
+
+    function renderOutputs(outputs) {
+      const posts = outputs.posts || [];
+      const reels = outputs.reels || [];
+      const total = Number(outputs.total_count || posts.length + reels.length);
+
+      if (!total) {
+        outputBox.innerHTML = "<span class='muted'>No output rows yet.</span>";
+        return;
+      }
+
+      const postsCards = posts.map(item => renderOutputCard(item, "Post")).join("");
+      const reelsCards = reels.map(item => renderOutputCard(item, "Reel")).join("");
+
+      outputBox.innerHTML = `
+        <div class='small'>Total outputs: ${esc(total)} | Posts: ${esc(posts.length)} | Reels: ${esc(reels.length)}</div>
+        <h4 style='margin:10px 0 6px;'>Posts</h4>
+        <div class='output-grid'>${postsCards || "<span class='muted'>No posts rows.</span>"}</div>
+        <h4 style='margin:12px 0 6px;'>Reels</h4>
+        <div class='output-grid'>${reelsCards || "<span class='muted'>No reels rows.</span>"}</div>
       `;
     }
 

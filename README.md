@@ -140,6 +140,7 @@ The UI lets you:
 - provide a profile URL and start a run
 - watch live run status
 - view sample rows for single-image post, multi-image post, and reel
+- view all captured post/reel outputs with media previews and metrics (likes, views, comments, hashtags, keywords, mentions)
 - open source post/reel URLs used for samples
 - download run artifacts (master, posts, reels)
 - open local sample media files from `Output/`

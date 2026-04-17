@@ -81,18 +81,33 @@ def _pick_sample(
 def _serialize_sample_row(row: dict[str, str] | None) -> dict | None:
     if not row:
         return None
+
+    return _serialize_output_row(row)
+
+
+def _serialize_output_row(row: dict[str, str] | None) -> dict | None:
+    if not row:
+        return None
+
     local_paths = _split_csv_values(row.get("media_asset_local_paths_csv") or "")
     return {
         "shortcode": row.get("shortcode"),
         "post_url": row.get("post_url"),
+        "posted_at_ist": row.get("posted_at_ist"),
         "media_type": row.get("media_type"),
+        "sample_bucket": row.get("sample_bucket"),
         "likes_count": row.get("likes_count"),
         "comments_count": row.get("comments_count"),
         "views_count": row.get("views_count"),
+        "is_remix_repost": row.get("is_remix_repost"),
+        "is_tagged_post": row.get("is_tagged_post"),
+        "tagged_users_count": row.get("tagged_users_count"),
         "hashtags_csv": row.get("hashtags_csv"),
         "keywords_csv": row.get("keywords_csv"),
         "mentions_csv": row.get("mentions_csv"),
         "caption_text": row.get("caption_text"),
+        "location_name": row.get("location_name"),
+        "missing_reason_post": row.get("missing_reason_post"),
         "media_asset_urls": _split_csv_values(row.get("media_asset_urls_csv") or ""),
         "media_asset_local_paths": local_paths,
         "media_asset_local_urls": [
@@ -279,6 +294,17 @@ def get_run_report(run_id: str) -> dict:
     if reels_csv_path:
         reels_rows = _read_csv_rows(Path(reels_csv_path))
 
+    output_posts = [
+        item
+        for item in (_serialize_output_row(row) for row in posts_rows)
+        if item is not None
+    ]
+    output_reels = [
+        item
+        for item in (_serialize_output_row(row) for row in reels_rows)
+        if item is not None
+    ]
+
     all_media_rows = posts_rows + reels_rows
 
     samples = {
@@ -302,5 +328,10 @@ def get_run_report(run_id: str) -> dict:
         "error_message": run.error_message,
         "profile": profile_row,
         "samples": samples,
+        "outputs": {
+            "posts": output_posts,
+            "reels": output_reels,
+            "total_count": len(output_posts) + len(output_reels),
+        },
         "artifacts": report_artifacts,
     }
