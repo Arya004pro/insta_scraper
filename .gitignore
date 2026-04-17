@@ -1,0 +1,45 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Test/cache/tooling artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build/package artifacts
+build/
+dist/
+site/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Runtime data and local state (sensitive/noisy)
+data/
+exports/
+*.sqlite3
+*.db
+*.log
+
+# Environment/config secrets
+.env
+.env.*
+*.pem
+*.key
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
