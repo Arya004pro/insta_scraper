@@ -1,6 +1,10 @@
 from app.collectors.about_scraper import _extract_by_label, _extract_following_line
 from app.collectors.grid_enumerator import extract_media_links_from_html
-from app.collectors.post_detail_scraper import _parse_counts_from_text
+from app.collectors.post_detail_scraper import (
+    _extract_like_comment_from_json_payload,
+    _extract_views_from_json_payload,
+    _parse_counts_from_text,
+)
 from app.anti_block.challenge_handler import detect_challenge
 from app.collectors.profile_scraper import (
     _parse_counts_from_og_description,
@@ -32,6 +36,7 @@ GRID_HTML = """
 """
 
 POST_DETAIL_TEXT = "1,234 likes, 78 comments, 45.6k views"
+POST_DETAIL_TEXT_PLAYS = "1,234 likes, 78 comments, 45.6k plays"
 OG_DESCRIPTION_TEXT = (
     "1M Followers, 2 Following, 710 Posts - "
     "See Instagram photos and videos from Indriya Jewels (@indriyajewels)"
@@ -67,6 +72,43 @@ def test_post_detail_count_parser_contract():
     assert likes == 1234
     assert comments == 78
     assert views == 45600
+
+
+def test_post_detail_count_parser_supports_plays_label():
+    likes, comments, views = _parse_counts_from_text(POST_DETAIL_TEXT_PLAYS)
+    assert likes == 1234
+    assert comments == 78
+    assert views == 45600
+
+
+class _MockPageJsonViews:
+    def content(self) -> str:
+        return (
+            '{"items":[{"code":"ABC123","like_count":10,'
+            '"comment_count":2,"play_count":12345}]}'
+        )
+
+
+def test_extract_views_from_json_payload_contract():
+    views = _extract_views_from_json_payload(_MockPageJsonViews(), "ABC123")
+    assert views == 12345
+
+
+class _MockPageJsonLikesComments:
+    def content(self) -> str:
+        return (
+            '{"feed":[{"code":"XYZ9","edge_media_preview_like":{"count":656},'
+            '"edge_media_to_parent_comment":{"count":82},"like_count":999,'
+            '"comment_count":888}]}'
+        )
+
+
+def test_extract_like_comment_from_json_payload_contract():
+    likes, comments = _extract_like_comment_from_json_payload(
+        _MockPageJsonLikesComments(), "XYZ9"
+    )
+    assert likes == 656
+    assert comments == 82
 
 
 def test_profile_og_count_parser_contract():

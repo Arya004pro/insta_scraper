@@ -4,12 +4,14 @@ import csv
 import mimetypes
 import os
 import random
+
 import re
 import shutil
 import subprocess
 import threading
 import time
 import uuid
+
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +19,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
+
 
 from app.anti_block.challenge_handler import collect_page_diagnostics, detect_challenge
 from app.anti_block.proxy_manager import ProxyManager
@@ -472,6 +475,84 @@ class RunOrchestrator:
             return "posts"
         return None
 
+    def _load_recent_post_cache(
+        self, username: str, max_files: int = 80
+    ) -> dict[str, dict[str, str]]:
+        if not username:
+            return {}
+
+        def _score(row: dict[str, str]) -> tuple[int, int, int, int]:
+            has_full_parse = int(not (row.get("missing_reason_post") or "").strip())
+            numeric_count = 0
+            for key in ("likes_count", "comments_count", "views_count"):
+                if (row.get(key) or "").strip():
+                    numeric_count += 1
+            has_caption = int(bool((row.get("caption_text") or "").strip()))
+            has_media = int(bool((row.get("media_asset_urls_csv") or "").strip()))
+            return (has_full_parse, numeric_count, has_caption, has_media)
+
+        files: list[Path] = []
+        for pattern in (
+            f"instagram_{username}_*_posts.csv",
+            f"instagram_{username}_*_reels.csv",
+        ):
+            files.extend(self.settings.exports_dir.glob(pattern))
+
+        files = sorted(
+            files,
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )
+
+        cache: dict[str, dict[str, str]] = {}
+        for path in files[:max_files]:
+            try:
+                with path.open("r", encoding="utf-8", newline="") as f:
+                    reader = csv.DictReader(f)
+                    for raw in reader:
+                        row = {k: (v or "") for k, v in (raw or {}).items()}
+                        shortcode = (row.get("shortcode") or "").strip()
+                        if not shortcode:
+                            continue
+                        current = cache.get(shortcode)
+                        if current is None or _score(row) > _score(current):
+                            cache[shortcode] = row
+            except Exception:
+                continue
+        return cache
+
+    def _hydrate_row_from_cache(
+        self,
+        row: dict[str, Any],
+        cache_row: dict[str, str],
+        keep_sample_bucket: bool = True,
+    ) -> None:
+        for key in (
+            "media_type",
+            "posted_at_ist",
+            "is_remix_repost",
+            "is_tagged_post",
+            "tagged_users_count",
+            "hashtags_csv",
+            "keywords_csv",
+            "mentions_csv",
+            "caption_text",
+            "location_name",
+            "media_asset_urls_csv",
+            "media_asset_local_paths_csv",
+        ):
+            cached = cache_row.get(key)
+            if not cached:
+                continue
+            current = row.get(key)
+            if current is None or (isinstance(current, str) and not current.strip()):
+                row[key] = cached
+
+        if not keep_sample_bucket:
+            cached_bucket = cache_row.get("sample_bucket")
+            if cached_bucket:
+                row["sample_bucket"] = cached_bucket
+
     def _profile_media_folder_name(
         self, username: str, full_name: str | None = None
     ) -> str:
@@ -664,6 +745,21 @@ class RunOrchestrator:
                 reason=f"challenge_detected:{pattern}",
             )
 
+            # HTTP 429 is a throttling signal; repeated auto-retries often worsen limits.
+            pattern_text = (pattern or "").lower()
+            if (
+                "429" in pattern_text
+                or "too many requests" in pattern_text
+                or "temporarily blocked" in pattern_text
+            ):
+                self.store.add_event(
+                    run_id,
+                    "Rate-limit challenge detected; skipping challenge auto-recovery to avoid extra pressure.",
+                    level="warning",
+                )
+                self.store.update_run(run_id, challenge_encountered=True)
+                return False
+
             attempts = max(0, self.settings.challenge_auto_retry_attempts)
             for attempt in range(1, attempts + 1):
                 self.store.add_event(
@@ -802,6 +898,7 @@ class RunOrchestrator:
                 resume_state.get("partial_posts_rows", [])
             )
             username = profile_row.get("username") or username_hint
+            recent_post_cache = self._load_recent_post_cache(username)
             sample_captured = {
                 "posts": False,
                 "reels": False,
@@ -810,6 +907,9 @@ class RunOrchestrator:
             required_samples = {"posts", "reels", "multi_image_posts"}
             consecutive_rate_limits = 0
             stop_post_loop_due_rate_limit = False
+            sample_mode_detail_budget = 6 if self.settings.sample_collection_mode else 0
+            sample_mode_detail_used = 0
+            timeline_items: list[dict[str, Any]] = []
 
             for row in posts_rows:
                 bucket = row.get("sample_bucket")
@@ -817,12 +917,12 @@ class RunOrchestrator:
                     sample_captured[bucket] = True
 
             discovered: list[dict[str, Any]] = []
+            timeline_by_shortcode: dict[str, dict[str, Any]] = {}
             if self.settings.sample_collection_mode:
                 self.store.add_event(
                     run_id,
                     "Sample mode enabled: collecting timeline snapshot first to avoid deep scrolling.",
                 )
-                timeline_items: list[dict[str, Any]] = []
                 try:
                     timeline_items = collect_recent_timeline_items(
                         page,
@@ -835,6 +935,27 @@ class RunOrchestrator:
                         f"Timeline snapshot unavailable ({type(exc).__name__}). Using visible grid fallback.",
                         level="warning",
                     )
+                    self.store.add_event(
+                        run_id,
+                        "Relaunching browser session before sample-mode fallback scan.",
+                        level="warning",
+                    )
+                    _relaunch_browser_session(
+                        "Relaunching browser session after timeline snapshot failure"
+                    )
+                    try:
+                        page.goto(profile_url, wait_until="domcontentloaded")
+                        page.wait_for_timeout(
+                            max(300, self.settings.post_detail_wait_ms)
+                        )
+                    except Exception:
+                        pass
+
+                timeline_by_shortcode = {
+                    str(item.get("shortcode")): item
+                    for item in timeline_items
+                    if item.get("shortcode")
+                }
 
                 for item in timeline_items:
                     if all(sample_captured[b] for b in required_samples):
@@ -918,6 +1039,20 @@ class RunOrchestrator:
                         "Sample mode fallback: scanning only currently visible grid posts (no deep scroll).",
                         level="warning",
                     )
+                    try:
+                        page.goto(profile_url, wait_until="domcontentloaded")
+                        page.wait_for_timeout(
+                            max(300, self.settings.post_detail_wait_ms)
+                        )
+                    except Exception as exc:
+                        if self._is_closed_context_error(exc):
+                            _relaunch_browser_session(
+                                "Relaunching browser session before sample-mode visible grid scan"
+                            )
+                            page.goto(profile_url, wait_until="domcontentloaded")
+                            page.wait_for_timeout(
+                                max(300, self.settings.post_detail_wait_ms)
+                            )
                     visible_scan_settings = replace(self.settings, scroll_idle_rounds=0)
                     discovered = enumerate_grid_posts(
                         page, visible_scan_settings, resume_state=resume_state
@@ -987,10 +1122,68 @@ class RunOrchestrator:
             if not grid_challenge_cleared:
                 discovered = []
 
+            if self.settings.sample_collection_mode and discovered:
+                priority_map: dict[str, int] = {}
+                rank = 0
+                if not sample_captured["multi_image_posts"]:
+                    priority_map["multi_image_posts"] = rank
+                    rank += 1
+                if not sample_captured["posts"]:
+                    priority_map["posts"] = rank
+                    rank += 1
+                if not sample_captured["reels"]:
+                    priority_map["reels"] = rank
+                    rank += 1
+
+                default_rank = 99
+                discovered = sorted(
+                    discovered,
+                    key=lambda item: priority_map.get(
+                        self._sample_bucket_for_media_type(
+                            (
+                                recent_post_cache.get(str(item.get("shortcode"))) or {}
+                            ).get("media_type")
+                        )
+                        or self._sample_bucket_for_media_type(
+                            item.get("media_type_hint")
+                        )
+                        or "",
+                        default_rank,
+                    ),
+                )
+
             for i, post in enumerate(discovered):
                 shortcode = post.get("shortcode")
                 if not shortcode or shortcode in processed:
                     continue
+                timeline_fallback = timeline_by_shortcode.get(str(shortcode), {})
+
+                if self.settings.sample_collection_mode:
+                    if all(sample_captured[b] for b in required_samples):
+                        break
+                    if sample_mode_detail_used >= sample_mode_detail_budget:
+                        self.store.add_event(
+                            run_id,
+                            f"Sample mode deep-request budget reached ({sample_mode_detail_budget}); stopping post-detail navigation.",
+                            level="warning",
+                        )
+                        break
+
+                    cached_media_type = (
+                        recent_post_cache.get(str(shortcode)) or {}
+                    ).get("media_type")
+                    media_hint = self._sample_bucket_for_media_type(
+                        cached_media_type
+                    ) or self._sample_bucket_for_media_type(post.get("media_type_hint"))
+                    if media_hint == "reels" and sample_captured["reels"]:
+                        continue
+                    if (
+                        media_hint == "multi_image_posts"
+                        and sample_captured["multi_image_posts"]
+                    ):
+                        continue
+                    if media_hint == "posts" and sample_captured["posts"]:
+                        continue
 
                 previous_proxy_id = proxy_manager.current_proxy_id()
                 active_proxy = proxy_manager.mark_request()
@@ -1015,6 +1208,9 @@ class RunOrchestrator:
                 while attempts < self.settings.retry_max_attempts:
                     attempts += 1
                     try:
+                        if self.settings.sample_collection_mode:
+                            sample_mode_detail_used += 1
+
                         detail = scrape_post_detail(
                             page,
                             post["post_url"],
@@ -1040,6 +1236,11 @@ class RunOrchestrator:
                         sample_bucket = self._sample_bucket_for_media_type(
                             detail.get("media_type")
                         )
+                        if detail.get("views_count") is None:
+                            timeline_views = timeline_fallback.get("views_count")
+                            if isinstance(timeline_views, int):
+                                detail["views_count"] = timeline_views
+
                         media_asset_local_paths: list[str] = []
                         if (
                             sample_bucket
@@ -1119,6 +1320,46 @@ class RunOrchestrator:
                         is_rate_limited = self._is_rate_limited_error(exc, page)
                         if is_rate_limited:
                             consecutive_rate_limits += 1
+
+                            if self.settings.sample_collection_mode:
+                                cooldown = max(
+                                    4.0,
+                                    min(
+                                        25.0,
+                                        self.settings.rate_limit_cooldown_seconds
+                                        * attempts,
+                                    ),
+                                )
+                                jitter = random.uniform(0.15, 0.35) * cooldown
+                                cooldown = cooldown + jitter
+                                self.store.add_event(
+                                    run_id,
+                                    f"Rate limit detected in sample mode on post {i + 1}. Cooling down {cooldown:.0f}s and retrying.",
+                                    level="warning",
+                                )
+                                _log_problem_diagnostics(
+                                    stage=f"post_detail_{i + 1}",
+                                    reason=f"rate_limit_sample_mode:{type(exc).__name__}:{exc}",
+                                )
+                                time.sleep(cooldown)
+
+                                _relaunch_browser_session(
+                                    f"Relaunching browser session after sample-mode rate limit on post {i + 1}"
+                                )
+
+                                if (
+                                    consecutive_rate_limits >= 3
+                                    and not self.settings.has_proxy_pool
+                                ):
+                                    self.store.add_event(
+                                        run_id,
+                                        "Repeated rate limits in sample mode; stopping deep navigation and using fallback rows.",
+                                        level="warning",
+                                    )
+                                    stop_post_loop_due_rate_limit = True
+                                    break
+                                continue
+
                             cooldown = max(
                                 1.0,
                                 self.settings.rate_limit_cooldown_seconds * attempts,
@@ -1178,29 +1419,123 @@ class RunOrchestrator:
                                 f"Retry rotating proxy to {rotated_proxy.proxy_id} for post {i + 1}"
                             )
                 if last_error and shortcode not in processed:
-                    posts_rows.append(
-                        {
-                            "scraped_at_ist": scraped_at,
-                            "run_id": run_id,
-                            "username": username,
-                            "shortcode": shortcode,
-                            "post_url": post["post_url"],
-                            "media_type": post.get("media_type_hint"),
-                            "posted_at_ist": None,
-                            "likes_count": None,
-                            "comments_count": None,
-                            "views_count": None,
-                            "is_remix_repost": None,
-                            "is_tagged_post": None,
-                            "tagged_users_count": None,
-                            "hashtags_csv": None,
-                            "keywords_csv": None,
-                            "mentions_csv": None,
-                            "caption_text": None,
-                            "location_name": None,
-                            "missing_reason_post": "parse_error",
-                        }
+                    fallback_remote_urls: list[str] = []
+                    thumbnail_url = post.get("thumbnail_url")
+                    if isinstance(thumbnail_url, str) and thumbnail_url.startswith(
+                        ("http://", "https://")
+                    ):
+                        fallback_remote_urls.append(thumbnail_url)
+
+                    fallback_sample_bucket: str | None = None
+                    fallback_local_paths: list[str] = []
+                    cached_media_type = (
+                        recent_post_cache.get(str(shortcode)) or {}
+                    ).get("media_type")
+                    hint_sample_bucket = self._sample_bucket_for_media_type(
+                        cached_media_type
+                    ) or self._sample_bucket_for_media_type(post.get("media_type_hint"))
+                    if (
+                        self.settings.sample_collection_mode
+                        and hint_sample_bucket
+                        and not sample_captured[hint_sample_bucket]
+                    ):
+                        fallback_sample_bucket = hint_sample_bucket
+                        if fallback_sample_bucket == "posts" and fallback_remote_urls:
+                            fallback_local_paths = self._download_sample_media_assets(
+                                run_id=run_id,
+                                username=username,
+                                full_name=profile_row.get("full_name"),
+                                sample_bucket=fallback_sample_bucket,
+                                shortcode=shortcode,
+                                media_asset_urls=fallback_remote_urls,
+                            )
+                            if fallback_local_paths:
+                                self._append_sample_manifest(
+                                    username=username,
+                                    full_name=profile_row.get("full_name"),
+                                    sample_bucket=fallback_sample_bucket,
+                                    shortcode=shortcode,
+                                    post_url=post["post_url"],
+                                    media_asset_urls=fallback_remote_urls,
+                                    media_asset_local_paths=fallback_local_paths,
+                                )
+                        sample_captured[hint_sample_bucket] = True
+                        self.store.add_event(
+                            run_id,
+                            f"Sample bucket '{hint_sample_bucket}' preserved from grid fallback ({shortcode}) after detail failure.",
+                            level="warning",
+                        )
+
+                    fallback_views_count = timeline_fallback.get("views_count")
+                    if not isinstance(fallback_views_count, int):
+                        fallback_views_count = None
+
+                    post_likes_count = post.get("likes_count")
+                    fallback_likes_count = (
+                        post_likes_count if isinstance(post_likes_count, int) else None
                     )
+
+                    post_comments_count = post.get("comments_count")
+                    fallback_comments_count = (
+                        post_comments_count
+                        if isinstance(post_comments_count, int)
+                        else None
+                    )
+
+                    fallback_media_type = cached_media_type or post.get(
+                        "media_type_hint"
+                    )
+
+                    fallback_row = {
+                        "scraped_at_ist": scraped_at,
+                        "run_id": run_id,
+                        "username": username,
+                        "shortcode": shortcode,
+                        "post_url": post["post_url"],
+                        "media_type": fallback_media_type,
+                        "posted_at_ist": None,
+                        "likes_count": fallback_likes_count,
+                        "comments_count": fallback_comments_count,
+                        "views_count": fallback_views_count,
+                        "is_remix_repost": None,
+                        "is_tagged_post": None,
+                        "tagged_users_count": None,
+                        "hashtags_csv": None,
+                        "keywords_csv": None,
+                        "mentions_csv": None,
+                        "caption_text": None,
+                        "location_name": None,
+                        "media_asset_urls_csv": ",".join(fallback_remote_urls)
+                        if fallback_remote_urls
+                        else None,
+                        "media_asset_local_paths_csv": ",".join(fallback_local_paths)
+                        if fallback_local_paths
+                        else None,
+                        "sample_bucket": fallback_sample_bucket,
+                        "missing_reason_post": "parse_error",
+                    }
+                    cached_row = recent_post_cache.get(str(shortcode))
+                    if cached_row:
+                        self._hydrate_row_from_cache(fallback_row, cached_row)
+                    if not fallback_row.get("sample_bucket"):
+                        fallback_row["sample_bucket"] = (
+                            self._sample_bucket_for_media_type(
+                                fallback_row.get("media_type")
+                            )
+                        )
+                    fallback_sample_bucket = fallback_row.get("sample_bucket")
+                    if (
+                        fallback_sample_bucket in sample_captured
+                        and not sample_captured[fallback_sample_bucket]
+                    ):
+                        sample_captured[fallback_sample_bucket] = True
+
+                    should_append_error_row = (
+                        not self.settings.sample_collection_mode
+                        or bool(fallback_sample_bucket)
+                    )
+                    if should_append_error_row:
+                        posts_rows.append(fallback_row)
                     processed.add(shortcode)
 
                 if self.settings.sample_collection_mode and all(
@@ -1210,6 +1545,226 @@ class RunOrchestrator:
 
                 if stop_post_loop_due_rate_limit:
                     break
+
+            if (
+                self.settings.sample_collection_mode
+                and timeline_items
+                and len(posts_rows) < 3
+            ):
+                backfilled = 0
+                for bucket in ("posts", "multi_image_posts", "reels"):
+                    if sample_captured[bucket]:
+                        continue
+                    candidate = next(
+                        (
+                            item
+                            for item in timeline_items
+                            if item.get("shortcode")
+                            and item.get("shortcode") not in processed
+                            and (
+                                item.get("sample_bucket")
+                                or self._sample_bucket_for_media_type(
+                                    item.get("media_type")
+                                )
+                            )
+                            == bucket
+                        ),
+                        None,
+                    )
+                    if not candidate:
+                        continue
+
+                    shortcode = candidate.get("shortcode")
+                    media_asset_urls = [
+                        x
+                        for x in (candidate.get("media_asset_urls") or [])
+                        if isinstance(x, str) and x
+                    ]
+                    row = {
+                        "scraped_at_ist": scraped_at,
+                        "run_id": run_id,
+                        "username": username,
+                        "shortcode": shortcode,
+                        "post_url": candidate.get("post_url"),
+                        "media_type": candidate.get("media_type"),
+                        "posted_at_ist": candidate.get("posted_at_ist"),
+                        "likes_count": candidate.get("likes_count"),
+                        "comments_count": candidate.get("comments_count"),
+                        "views_count": candidate.get("views_count"),
+                        "is_remix_repost": candidate.get("is_remix_repost"),
+                        "is_tagged_post": candidate.get("is_tagged_post"),
+                        "tagged_users_count": candidate.get("tagged_users_count"),
+                        "hashtags_csv": candidate.get("hashtags_csv"),
+                        "keywords_csv": candidate.get("keywords_csv"),
+                        "mentions_csv": candidate.get("mentions_csv"),
+                        "caption_text": candidate.get("caption_text"),
+                        "location_name": candidate.get("location_name"),
+                        "media_asset_urls_csv": ",".join(media_asset_urls)
+                        if media_asset_urls
+                        else None,
+                        "media_asset_local_paths_csv": None,
+                        "sample_bucket": bucket,
+                        "missing_reason_post": "timeline_fallback",
+                    }
+                    posts_rows.append({k: row.get(k) for k in POSTS_COLUMNS})
+                    processed.add(shortcode)
+                    sample_captured[bucket] = True
+                    backfilled += 1
+
+                if backfilled:
+                    self.store.add_event(
+                        run_id,
+                        f"Backfilled {backfilled} timeline rows after limited deep extraction.",
+                        level="warning",
+                    )
+
+            if (
+                self.settings.sample_collection_mode
+                and len(posts_rows) < 3
+                and discovered
+            ):
+                backfilled_grid = 0
+                for bucket in ("posts", "multi_image_posts", "reels"):
+                    if sample_captured[bucket]:
+                        continue
+                    candidate = next(
+                        (
+                            item
+                            for item in discovered
+                            if item.get("shortcode")
+                            and item.get("shortcode") not in processed
+                            and (
+                                self._sample_bucket_for_media_type(
+                                    (
+                                        recent_post_cache.get(
+                                            str(item.get("shortcode"))
+                                        )
+                                        or {}
+                                    ).get("media_type")
+                                )
+                                or self._sample_bucket_for_media_type(
+                                    item.get("media_type_hint")
+                                )
+                            )
+                            == bucket
+                        ),
+                        None,
+                    )
+                    if not candidate:
+                        continue
+
+                    shortcode = candidate.get("shortcode")
+                    cached_media_type = (
+                        recent_post_cache.get(str(shortcode)) or {}
+                    ).get("media_type")
+                    media_type_hint = cached_media_type or candidate.get(
+                        "media_type_hint"
+                    )
+                    timeline_candidate = timeline_by_shortcode.get(str(shortcode), {})
+                    fallback_remote_urls: list[str] = []
+                    thumbnail_url = candidate.get("thumbnail_url")
+                    if isinstance(thumbnail_url, str) and thumbnail_url.startswith(
+                        ("http://", "https://")
+                    ):
+                        fallback_remote_urls.append(thumbnail_url)
+
+                    candidate_likes_count = candidate.get("likes_count")
+                    candidate_comments_count = candidate.get("comments_count")
+                    row = {
+                        "scraped_at_ist": scraped_at,
+                        "run_id": run_id,
+                        "username": username,
+                        "shortcode": shortcode,
+                        "post_url": candidate.get("post_url"),
+                        "media_type": media_type_hint,
+                        "posted_at_ist": timeline_candidate.get("posted_at_ist"),
+                        "likes_count": candidate_likes_count
+                        if isinstance(candidate_likes_count, int)
+                        else None,
+                        "comments_count": candidate_comments_count
+                        if isinstance(candidate_comments_count, int)
+                        else None,
+                        "views_count": timeline_candidate.get("views_count"),
+                        "is_remix_repost": timeline_candidate.get("is_remix_repost"),
+                        "is_tagged_post": timeline_candidate.get("is_tagged_post"),
+                        "tagged_users_count": timeline_candidate.get(
+                            "tagged_users_count"
+                        ),
+                        "hashtags_csv": timeline_candidate.get("hashtags_csv"),
+                        "keywords_csv": timeline_candidate.get("keywords_csv"),
+                        "mentions_csv": timeline_candidate.get("mentions_csv"),
+                        "caption_text": timeline_candidate.get("caption_text"),
+                        "location_name": timeline_candidate.get("location_name"),
+                        "media_asset_urls_csv": ",".join(fallback_remote_urls)
+                        if fallback_remote_urls
+                        else None,
+                        "media_asset_local_paths_csv": None,
+                        "sample_bucket": bucket,
+                        "missing_reason_post": "grid_fallback",
+                    }
+                    cached_row = recent_post_cache.get(str(shortcode))
+                    if cached_row:
+                        self._hydrate_row_from_cache(
+                            row, cached_row, keep_sample_bucket=True
+                        )
+                    posts_rows.append({k: row.get(k) for k in POSTS_COLUMNS})
+                    processed.add(shortcode)
+                    sample_captured[bucket] = True
+                    backfilled_grid += 1
+
+                if backfilled_grid:
+                    self.store.add_event(
+                        run_id,
+                        f"Backfilled {backfilled_grid} grid rows after limited deep extraction.",
+                        level="warning",
+                    )
+
+            if self.settings.sample_collection_mode and posts_rows:
+
+                def _bucket_for_row(row: dict[str, Any]) -> str | None:
+                    bucket = row.get("sample_bucket")
+                    if bucket in required_samples:
+                        return bucket
+                    return self._sample_bucket_for_media_type(row.get("media_type"))
+
+                def _row_score(
+                    row: dict[str, Any], bucket: str
+                ) -> tuple[int, int, int, int, int]:
+                    has_full_parse = int(
+                        not bool((row.get("missing_reason_post") or "").strip())
+                    )
+                    numeric_count = 0
+                    for field in ("likes_count", "comments_count", "views_count"):
+                        value = row.get(field)
+                        if isinstance(value, int):
+                            numeric_count += 1
+                        elif isinstance(value, str) and value.strip():
+                            numeric_count += 1
+                    has_caption = int(bool((row.get("caption_text") or "").strip()))
+                    has_media = int(
+                        bool((row.get("media_asset_urls_csv") or "").strip())
+                    )
+                    has_exact_bucket = int((row.get("sample_bucket") or "") == bucket)
+                    return (
+                        has_full_parse,
+                        numeric_count,
+                        has_caption,
+                        has_media,
+                        has_exact_bucket,
+                    )
+
+                curated_rows: list[dict[str, Any]] = []
+                for bucket in ("posts", "multi_image_posts", "reels"):
+                    candidates = [
+                        row for row in posts_rows if _bucket_for_row(row) == bucket
+                    ]
+                    if not candidates:
+                        continue
+                    best = max(candidates, key=lambda row: _row_score(row, bucket))
+                    curated_rows.append(best)
+
+                if curated_rows:
+                    posts_rows = curated_rows
 
             aggregates_rows = build_aggregates(
                 scraped_at_ist=scraped_at,

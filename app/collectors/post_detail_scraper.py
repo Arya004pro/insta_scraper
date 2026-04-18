@@ -73,11 +73,98 @@ def _parse_counts_from_text(text: str) -> tuple[int | None, int | None, int | No
     m_comments = re.search(r"([\d,.]+[kmb]?)\s+comments?", text, re.IGNORECASE)
     if m_comments:
         comments = _to_int(m_comments.group(1))
-    m_views = re.search(r"([\d,.]+[kmb]?)\s+views", text, re.IGNORECASE)
+    m_views = re.search(r"([\d,.]+[kmb]?)\s+(?:views?|plays?)\b", text, re.IGNORECASE)
     if m_views:
         views = _to_int(m_views.group(1))
 
     return likes, comments, views
+
+
+def _extract_views_from_json_payload(page: object, shortcode: str) -> int | None:
+    try:
+        html = page.content()
+    except Exception:
+        return None
+
+    if not html:
+        return None
+
+    scopes: list[str] = []
+    token = f'"code":"{shortcode}"'
+    idx = html.find(token)
+    if idx >= 0:
+        # Prefer metrics near the current shortcode to avoid picking unrelated cards.
+        start = max(0, idx - 6000)
+        end = min(len(html), idx + 20000)
+        scopes.append(html[start:end])
+    scopes.append(html)
+
+    keys = ("video_view_count", "play_count", "video_play_count", "view_count")
+    for scope in scopes:
+        for key in keys:
+            pattern = rf'"{key}"\s*:\s*(?:"([^"]+)"|([0-9][0-9,\.]*[kmbKMB]?)|null)'
+            for match in re.finditer(pattern, scope):
+                raw = match.group(1) or match.group(2)
+                value = _to_int(raw) if raw else None
+                if value is not None:
+                    return value
+    return None
+
+
+def _extract_like_comment_from_json_payload(
+    page: object, shortcode: str
+) -> tuple[int | None, int | None]:
+    try:
+        html = page.content()
+    except Exception:
+        return None, None
+
+    if not html:
+        return None, None
+
+    scopes: list[str] = []
+    token = f'"code":"{shortcode}"'
+    idx = html.find(token)
+    if idx >= 0:
+        # Prefer data around current shortcode to avoid counts from suggested cards.
+        start = max(0, idx - 8000)
+        end = min(len(html), idx + 30000)
+        scopes.append(html[start:end])
+    scopes.append(html)
+
+    like_patterns = [
+        r'"edge_media_preview_like"\s*:\s*\{[^{}]{0,300}?"count"\s*:\s*([0-9][0-9,\.]*)',
+        r'"like_count"\s*:\s*([0-9][0-9,\.]*)',
+    ]
+    comment_patterns = [
+        r'"edge_media_to_parent_comment"\s*:\s*\{[^{}]{0,300}?"count"\s*:\s*([0-9][0-9,\.]*)',
+        r'"edge_media_to_comment"\s*:\s*\{[^{}]{0,300}?"count"\s*:\s*([0-9][0-9,\.]*)',
+        r'"comment_count"\s*:\s*([0-9][0-9,\.]*)',
+    ]
+
+    likes: int | None = None
+    comments: int | None = None
+    for scope in scopes:
+        if likes is None:
+            for pattern in like_patterns:
+                match = re.search(pattern, scope)
+                if not match:
+                    continue
+                likes = _to_int(match.group(1))
+                if likes is not None:
+                    break
+        if comments is None:
+            for pattern in comment_patterns:
+                match = re.search(pattern, scope)
+                if not match:
+                    continue
+                comments = _to_int(match.group(1))
+                if comments is not None:
+                    break
+        if likes is not None and comments is not None:
+            break
+
+    return likes, comments
 
 
 def _extract_caption(page: object) -> str | None:
@@ -327,6 +414,8 @@ def scrape_post_detail(
     if page_settle_ms > 0:
         page.wait_for_timeout(page_settle_ms)
 
+    shortcode = post_url.rstrip("/").split("/")[-1]
+
     media_type = media_type_hint or ("reel" if "/reel/" in post_url else "image_post")
     if media_type == "image_post":
         try:
@@ -354,7 +443,13 @@ def scrape_post_detail(
     parse_text = " ".join([x for x in [caption, og_description] if x]) or ""
     likes_count, comments_count, views_count = _parse_counts_from_text(parse_text)
 
-    if likes_count is None or comments_count is None:
+    json_likes, json_comments = _extract_like_comment_from_json_payload(page, shortcode)
+    if json_likes is not None:
+        likes_count = json_likes
+    if json_comments is not None:
+        comments_count = json_comments
+
+    if likes_count is None or comments_count is None or views_count is None:
         try:
             body = page.inner_text("body", timeout=1500)
             l2, c2, v2 = _parse_counts_from_text(body)
@@ -363,6 +458,9 @@ def scrape_post_detail(
             views_count = views_count if views_count is not None else v2
         except Exception:
             pass
+
+    if views_count is None:
+        views_count = _extract_views_from_json_payload(page, shortcode)
 
     hashtags = HASHTAG_RE.findall(caption or "")
     mentions = MENTION_RE.findall(caption or "")
@@ -380,7 +478,7 @@ def scrape_post_detail(
         missing_reason = "parse_error"
 
     return {
-        "shortcode": post_url.rstrip("/").split("/")[-1],
+        "shortcode": shortcode,
         "post_url": post_url,
         "media_type": media_type,
         "posted_at_ist": _extract_posted_time_ist(page),

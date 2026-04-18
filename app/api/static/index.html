@@ -83,9 +83,17 @@
       padding: 8px;
       vertical-align: top;
       font-size: 13px;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      white-space: normal;
     }
     th { color: var(--muted); font-weight: 600; width: 180px; }
-    a { color: #87d4ff; word-break: break-all; }
+    a {
+      color: #87d4ff;
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
     .sample-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -203,14 +211,14 @@
     }
 
     function esc(value) {
-      return String(value ?? "").replace(/[&<>\"]/g, function (c) {
-        return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c];
+      return String(value ?? "").replace(/[&<>\"']/g, function (c) {
+        return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];
       });
     }
 
     function linkList(items) {
       if (!items || !items.length) return "<span class='muted'>none</span>";
-      return "<ul>" + items.map(x => `<li><a href="${esc(x)}" target="_blank">${esc(x)}</a></li>`).join("") + "</ul>";
+      return "<ul>" + items.map(x => `<li><a href="${esc(x)}" target="_blank" rel="noopener noreferrer">${esc(x)}</a></li>`).join("") + "</ul>";
     }
 
     async function startRun() {
@@ -317,7 +325,7 @@
         <div class="sample">
           <strong>${esc(title)}</strong>
           <table>
-            <tr><th>Post URL</th><td><a href="${esc(item.post_url)}" target="_blank">${esc(item.post_url)}</a></td></tr>
+            <tr><th>Post URL</th><td><a href="${esc(item.post_url)}" target="_blank" rel="noopener noreferrer">${esc(item.post_url)}</a></td></tr>
             <tr><th>Media Type</th><td>${esc(item.media_type)}</td></tr>
             <tr><th>Likes</th><td>${esc(item.likes_count)}</td></tr>
             <tr><th>Comments</th><td>${esc(item.comments_count)}</td></tr>
@@ -361,7 +369,7 @@
       if (/\.(jpg|jpeg|png|webp|gif)(\?|$)/.test(lower)) {
         return `<div class='preview-wrap'><img class='preview-media' src='${esc(url)}' alt='media preview' loading='lazy'/></div>`;
       }
-      return `<div class='small'><a href='${esc(url)}' target='_blank'>Open media file</a></div>`;
+      return `<div class='small'><a href='${esc(url)}' target='_blank' rel='noopener noreferrer'>Open media file</a></div>`;
     }
 
     function renderCompactLinks(urls, label, maxCount = 3) {
@@ -373,7 +381,7 @@
       return `
         <div class='small'>${esc(label)}:</div>
         <ul>
-          ${shown.map(u => `<li><a href='${esc(u)}' target='_blank'>${esc(u)}</a></li>`).join("")}
+          ${shown.map(u => `<li><a href='${esc(u)}' target='_blank' rel='noopener noreferrer'>${esc(u)}</a></li>`).join("")}
           ${extra > 0 ? `<li class='muted'>+${extra} more</li>` : ""}
         </ul>
       `;
@@ -390,7 +398,7 @@
       return `
         <div class='output-card'>
           <div>${pills}</div>
-          <div style='margin-top:6px;'><a href='${esc(item.post_url || "")}' target='_blank'>${esc(item.post_url || "")}</a></div>
+          <div style='margin-top:6px;'><a href='${esc(item.post_url || "")}' target='_blank' rel='noopener noreferrer'>${esc(item.post_url || "")}</a></div>
           ${renderPreview(previewUrl)}
           <table>
             <tr><th>Likes</th><td>${esc(item.likes_count || "")}</td></tr>
@@ -441,7 +449,7 @@
       artifactBox.innerHTML = "<ul>" + keys.map(k => {
         const item = artifacts[k];
         const state = item.exists ? "ready" : "missing";
-        return `<li><a href="${esc(item.download_url)}" target="_blank">${esc(k)}</a> <span class='muted'>(${state})</span></li>`;
+        return `<li><a href="${esc(item.download_url)}" target="_blank" rel="noopener noreferrer">${esc(k)}</a> <span class='muted'>(${state})</span></li>`;
       }).join("") + "</ul>";
     }
 

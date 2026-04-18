@@ -55,12 +55,21 @@ def _split_csv_values(value: str) -> list[str]:
     return [x.strip() for x in value.split(",") if x.strip()]
 
 
+def _is_http_url(value: str | None) -> bool:
+    if not value:
+        return False
+    v = value.strip().lower()
+    return v.startswith("http://") or v.startswith("https://")
+
+
 def _output_url_from_local_path(local_path: str) -> str | None:
     if not local_path:
         return None
     try:
         root = settings.media_dir.resolve()
         file_path = Path(local_path).resolve()
+        if not file_path.exists() or not file_path.is_file():
+            return None
         if not file_path.is_relative_to(root):
             return None
         rel = file_path.relative_to(root).as_posix()
@@ -72,10 +81,42 @@ def _output_url_from_local_path(local_path: str) -> str | None:
 def _pick_sample(
     posts_rows: list[dict[str, str]], bucket: str
 ) -> dict[str, str] | None:
+    def _matches_bucket(row: dict[str, str]) -> bool:
+        sample_bucket = (row.get("sample_bucket") or "").strip().lower()
+        if sample_bucket == bucket:
+            return True
+
+        media_type = (row.get("media_type") or "").strip().lower()
+        if bucket == "posts":
+            return media_type in {"image_post", "video_post"}
+        if bucket == "multi_image_posts":
+            return media_type == "carousel_post"
+        if bucket == "reels":
+            return media_type == "reel"
+        return False
+
+    best_row: dict[str, str] | None = None
+    best_score: tuple[int, int, int] = (-1, -1, -1)
+
     for row in posts_rows:
-        if row.get("sample_bucket") == bucket and row.get("post_url"):
-            return row
-    return None
+        post_url = row.get("post_url")
+        if not _is_http_url(post_url) or not _matches_bucket(row):
+            continue
+
+        has_exact_bucket = int(
+            (row.get("sample_bucket") or "").strip().lower() == bucket
+        )
+        has_any_media = int(
+            bool(_split_csv_values(row.get("media_asset_local_paths_csv") or ""))
+            or bool(_split_csv_values(row.get("media_asset_urls_csv") or ""))
+        )
+        has_full_parse = int(not (row.get("missing_reason_post") or "").strip())
+        score = (has_exact_bucket, has_any_media, has_full_parse)
+        if score > best_score:
+            best_score = score
+            best_row = row
+
+    return best_row
 
 
 def _serialize_sample_row(row: dict[str, str] | None) -> dict | None:
@@ -90,9 +131,18 @@ def _serialize_output_row(row: dict[str, str] | None) -> dict | None:
         return None
 
     local_paths = _split_csv_values(row.get("media_asset_local_paths_csv") or "")
+    media_asset_urls = [
+        u
+        for u in _split_csv_values(row.get("media_asset_urls_csv") or "")
+        if _is_http_url(u)
+    ]
+    post_url = row.get("post_url")
+    if not _is_http_url(post_url):
+        post_url = None
+
     return {
         "shortcode": row.get("shortcode"),
-        "post_url": row.get("post_url"),
+        "post_url": post_url,
         "posted_at_ist": row.get("posted_at_ist"),
         "media_type": row.get("media_type"),
         "sample_bucket": row.get("sample_bucket"),
@@ -108,7 +158,7 @@ def _serialize_output_row(row: dict[str, str] | None) -> dict | None:
         "caption_text": row.get("caption_text"),
         "location_name": row.get("location_name"),
         "missing_reason_post": row.get("missing_reason_post"),
-        "media_asset_urls": _split_csv_values(row.get("media_asset_urls_csv") or ""),
+        "media_asset_urls": media_asset_urls,
         "media_asset_local_paths": local_paths,
         "media_asset_local_urls": [
             u for u in (_output_url_from_local_path(x) for x in local_paths) if u
