@@ -241,12 +241,10 @@
       if (value === null || value === undefined || value === "") return "";
       const n = Number(String(value).replace(/,/g, ""));
       if (!Number.isFinite(n)) return String(value);
-      const compact = new Intl.NumberFormat("en", {
+      return new Intl.NumberFormat("en", {
         notation: "compact",
         maximumFractionDigits: 1,
       }).format(n);
-      const full = new Intl.NumberFormat("en").format(n);
-      return `${compact} (${full})`;
     }
 
     async function startRun() {
@@ -353,17 +351,23 @@
         return;
       }
 
-      renderProfile(data.profile);
+      renderProfile(data.profile, data.external_links || []);
       renderSamples(data.samples || {});
       renderOutputs(data.outputs || {});
       renderArtifacts(data.artifacts || {});
     }
 
-    function renderProfile(profile) {
+    function renderProfile(profile, externalLinks) {
       if (!profile) {
         profileBox.innerHTML = "<span class='muted'>Profile CSV not available.</span>";
         return;
       }
+
+      const normalizedExternalLinks = (externalLinks || [])
+        .map(item => (item && typeof item === "object") ? (item.url || item.final_url || item.expanded_url || item.raw_url || "") : String(item || ""))
+        .map(url => String(url || "").trim())
+        .filter(Boolean);
+
       const rows = [
         ["Username", profile.username],
         ["Full Name", profile.full_name],
@@ -373,8 +377,15 @@
         ["Date Joined", profile.date_joined],
         ["Based In", profile.account_based_in],
         ["Verified Time", profile.time_verified],
+        ["Primary External URL", profile.external_url_primary],
+        ["Active Ads", profile.active_ads_status],
+        ["Active Ads URL", profile.active_ads_url],
       ];
-      profileBox.innerHTML = `<table>${rows.map(([k,v]) => `<tr><th>${esc(k)}</th><td>${esc(v || "")}</td></tr>`).join("")}</table>`;
+      profileBox.innerHTML = `
+        <table>${rows.map(([k,v]) => `<tr><th>${esc(k)}</th><td>${esc(v || "")}</td></tr>`).join("")}</table>
+        <div class="small" style="margin-top:8px;">All External Links:</div>
+        ${linkList(normalizedExternalLinks)}
+      `;
     }
 
     function renderSampleCard(title, item) {

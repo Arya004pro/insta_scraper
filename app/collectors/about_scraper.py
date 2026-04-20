@@ -34,20 +34,72 @@ def _extract_about_dialog_text(page: object) -> str:
 
 
 def _click_about_from_menu(page: object) -> bool:
-    candidates = [
-        "[role='menuitem']:has-text('About this account')",
-        "div[role='dialog'] button:has-text('About this account')",
-        "div[role='dialog'] a:has-text('About this account')",
-        "div[role='dialog'] :text('About this account')",
+    text_pattern = re.compile(r"about this account", re.IGNORECASE)
+    locator_factories = [
+        lambda: page.get_by_role("menuitem", name=text_pattern).first,
+        lambda: (
+            page.locator("div[role='dialog'] button")
+            .filter(has_text=text_pattern)
+            .first
+        ),
+        lambda: (
+            page.locator("div[role='dialog'] a").filter(has_text=text_pattern).first
+        ),
+        lambda: page.get_by_text(text_pattern).first,
     ]
-    for selector in candidates:
+
+    for make_locator in locator_factories:
         try:
-            page.locator(selector).first.click(timeout=1800)
+            locator = make_locator()
+            if locator.count() <= 0:
+                continue
+
+            clicked = False
+            for force_click in (False, True):
+                try:
+                    locator.click(timeout=1800, force=force_click)
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+
+            if not clicked:
+                continue
+
             page.wait_for_timeout(700)
             if _is_about_details_text(_extract_about_dialog_text(page)):
                 return True
         except Exception:
             continue
+
+    try:
+        clicked_by_js = bool(
+            page.evaluate(
+                """
+                () => {
+                  const dialogs = Array.from(document.querySelectorAll("div[role='dialog']"));
+                  for (let d = dialogs.length - 1; d >= 0; d--) {
+                    const buttons = Array.from(dialogs[d].querySelectorAll('button, a, [role="button"]'));
+                    for (const node of buttons) {
+                      const text = (node.textContent || '').trim().toLowerCase();
+                      if (text === 'about this account' || text.includes('about this account')) {
+                        node.click();
+                        return true;
+                      }
+                    }
+                  }
+                  return false;
+                }
+                """
+            )
+        )
+        if clicked_by_js:
+            page.wait_for_timeout(700)
+            if _is_about_details_text(_extract_about_dialog_text(page)):
+                return True
+    except Exception:
+        pass
+
     return False
 
 
@@ -57,7 +109,10 @@ def _open_about_dialog(page: object) -> bool:
             re.compile(r"about this account", re.IGNORECASE)
         ).first
         if direct.count() > 0:
-            direct.click(timeout=1500)
+            try:
+                direct.click(timeout=1500)
+            except Exception:
+                direct.click(timeout=1500, force=True)
             page.wait_for_timeout(600)
             if _is_about_details_text(_extract_about_dialog_text(page)):
                 return True
@@ -71,10 +126,43 @@ def _open_about_dialog(page: object) -> bool:
         "button[aria-label='Options']",
         "button[aria-label='More options']",
         "svg[aria-label='Options']",
+        "svg[aria-label='More options']",
     ]
     for selector in button_selectors:
         try:
-            page.locator(selector).first.click(timeout=1500)
+            target = page.locator(selector).first
+            if target.count() <= 0:
+                continue
+
+            opened = False
+            for force_click in (False, True):
+                try:
+                    target.click(timeout=1500, force=force_click)
+                    opened = True
+                    break
+                except Exception:
+                    continue
+
+            if not opened and selector.startswith("svg"):
+                try:
+                    opened = bool(
+                        target.evaluate(
+                            """
+                            el => {
+                              const buttonLike = el.closest('[role="button"]') || el.parentElement;
+                              if (!buttonLike) return false;
+                              buttonLike.click();
+                              return true;
+                            }
+                            """
+                        )
+                    )
+                except Exception:
+                    opened = False
+
+            if not opened:
+                continue
+
             page.wait_for_timeout(500)
             if _click_about_from_menu(page):
                 return True
@@ -86,11 +174,42 @@ def _open_about_dialog(page: object) -> bool:
         except Exception:
             continue
 
+    # JS fallback: click any visible options icon container in the header area.
+    try:
+        clicked_by_js = bool(
+            page.evaluate(
+                """
+                () => {
+                  const nodes = Array.from(
+                    document.querySelectorAll(
+                      "header svg[aria-label='Options'], header svg[aria-label='More options'], svg[aria-label='Options'], svg[aria-label='More options']"
+                    )
+                  );
+                  for (const icon of nodes) {
+                    const clickTarget = icon.closest('[role="button"]') || icon.parentElement;
+                    if (!clickTarget) continue;
+                    clickTarget.click();
+                    return true;
+                  }
+                  return false;
+                }
+                """
+            )
+        )
+        if clicked_by_js:
+            page.wait_for_timeout(500)
+            if _click_about_from_menu(page):
+                return True
+    except Exception:
+        pass
+
     # Last attempt: if about text is visible now, click it once more.
     try:
-        page.get_by_text(re.compile(r"about this account", re.IGNORECASE)).first.click(
-            timeout=1500
-        )
+        about = page.get_by_text(re.compile(r"about this account", re.IGNORECASE)).first
+        try:
+            about.click(timeout=1500)
+        except Exception:
+            about.click(timeout=1500, force=True)
         page.wait_for_timeout(600)
         if _is_about_details_text(_extract_about_dialog_text(page)):
             return True

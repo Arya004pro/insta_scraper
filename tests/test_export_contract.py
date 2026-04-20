@@ -36,7 +36,13 @@ def test_csv_export_contract(tmp_path: Path):
         summary_flat_rows=summary,
     )
 
-    assert set(artifacts.keys()) == {"posts_csv", "reels_csv", "master_summary_csv"}
+    assert set(artifacts.keys()) == {
+        "posts_csv",
+        "reels_csv",
+        "profile_csv",
+        "external_links_csv",
+        "master_summary_csv",
+    }
 
     posts_csv = Path(artifacts["posts_csv"])
     header = posts_csv.read_text(encoding="utf-8").splitlines()[0].split(",")
@@ -47,6 +53,16 @@ def test_csv_export_contract(tmp_path: Path):
     reels_header = reels_csv.read_text(encoding="utf-8").splitlines()[0].split(",")
     assert reels_header[0] == "scraped_at_ist"
     assert reels_header == POSTS_COLUMNS
+
+    profile_csv = Path(artifacts["profile_csv"])
+    profile_header = profile_csv.read_text(encoding="utf-8").splitlines()[0].split(",")
+    assert profile_header[0] == "scraped_at_ist"
+    assert profile_header == PROFILE_COLUMNS
+
+    links_csv = Path(artifacts["external_links_csv"])
+    links_header = links_csv.read_text(encoding="utf-8").splitlines()[0].split(",")
+    assert links_header[0] == "scraped_at_ist"
+    assert links_header == EXTERNAL_LINKS_COLUMNS
 
 
 def test_xlsx_export_contract(tmp_path: Path):

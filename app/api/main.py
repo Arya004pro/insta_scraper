@@ -181,6 +181,53 @@ def _serialize_output_row(row: dict[str, str] | None) -> dict | None:
     }
 
 
+def _serialize_external_links(
+    links_rows: list[dict[str, str]], profile_row: dict[str, str] | None
+) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    output: list[dict[str, str]] = []
+
+    for row in links_rows:
+        raw_url = (row.get("raw_url") or "").strip()
+        expanded_url = (row.get("expanded_url") or "").strip()
+        final_url = (row.get("final_url") or "").strip()
+        primary = final_url or expanded_url or raw_url
+        if not _is_http_url(primary):
+            continue
+        if primary in seen:
+            continue
+        seen.add(primary)
+
+        output.append(
+            {
+                "url": primary,
+                "raw_url": raw_url,
+                "expanded_url": expanded_url,
+                "final_url": final_url,
+                "domain": (row.get("domain") or "").strip(),
+                "http_status": (row.get("http_status") or "").strip(),
+                "source_surface": (row.get("source_surface") or "").strip(),
+            }
+        )
+
+    if not output:
+        fallback_url = (profile_row or {}).get("external_url_primary", "").strip()
+        if _is_http_url(fallback_url):
+            output.append(
+                {
+                    "url": fallback_url,
+                    "raw_url": fallback_url,
+                    "expanded_url": "",
+                    "final_url": "",
+                    "domain": "",
+                    "http_status": "",
+                    "source_surface": "profile_header",
+                }
+            )
+
+    return output
+
+
 def _profile_from_summary_row(summary_row: dict[str, str]) -> dict[str, str]:
     return {
         "username": summary_row.get("Username", ""),
@@ -387,6 +434,11 @@ def get_run_report(run_id: str) -> dict:
     if reels_csv_path:
         reels_rows = _read_csv_rows(Path(reels_csv_path))
 
+    external_links_rows: list[dict[str, str]] = []
+    external_links_csv_path = artifacts.get("external_links_csv")
+    if external_links_csv_path:
+        external_links_rows = _read_csv_rows(Path(external_links_csv_path))
+
     output_posts = [
         item
         for item in (_serialize_output_row(row) for row in posts_rows)
@@ -412,6 +464,8 @@ def get_run_report(run_id: str) -> dict:
         ),
     }
 
+    external_links = _serialize_external_links(external_links_rows, profile_row)
+
     return {
         "run_id": run_id,
         "status": run.status,
@@ -420,6 +474,7 @@ def get_run_report(run_id: str) -> dict:
         "error_code": run.error_code,
         "error_message": run.error_message,
         "profile": profile_row,
+        "external_links": external_links,
         "samples": samples,
         "outputs": {
             "posts": output_posts,
