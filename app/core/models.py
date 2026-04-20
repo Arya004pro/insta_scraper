@@ -43,6 +43,7 @@ PROFILE_COLUMNS = [
     "profile_url",
     "full_name",
     "biography",
+    "email_address",
     "external_url_primary",
     "followers_count",
     "following_count",
@@ -95,6 +96,7 @@ POSTS_COLUMNS = [
     "likes_count",
     "comments_count",
     "views_count",
+    "repost_count",
     "is_remix_repost",
     "is_tagged_post",
     "tagged_users_count",
@@ -217,6 +219,7 @@ class PostRecord(BaseModel):
     likes_count: int | None = None
     comments_count: int | None = None
     views_count: int | None = None
+    repost_count: int | None = None
     is_remix_repost: bool | None = None
     is_tagged_post: bool | None = None
     tagged_users_count: int | None = None
@@ -241,6 +244,7 @@ class ProfileRecord(BaseModel):
     profile_url: str | None = None
     full_name: str | None = None
     biography: str | None = None
+    email_address: str | None = None
     external_url_primary: str | None = None
     followers_count: int | None = None
     following_count: int | None = None

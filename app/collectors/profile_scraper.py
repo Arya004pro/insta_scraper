@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse, urlunparse
 
 
 PRIVATE_PATTERNS = [
@@ -15,6 +15,11 @@ ERROR_PAGE_PATTERNS = [
     re.compile(r"page could not be loaded", re.IGNORECASE),
     re.compile(r"reload page", re.IGNORECASE),
 ]
+
+EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+-])([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})(?![A-Za-z0-9._%+-])",
+    re.IGNORECASE,
+)
 
 
 def parse_metric_count(raw: str | None) -> int | None:
@@ -249,6 +254,96 @@ def _extract_profile_pic(page: object) -> str | None:
     return None
 
 
+def _extract_emails(text: str | None) -> list[str]:
+    if not text:
+        return []
+    found = [m.group(1).strip() for m in EMAIL_RE.finditer(text)]
+    out: list[str] = []
+    seen: set[str] = set()
+    for email in found:
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(email)
+    return out
+
+
+def _extract_profile_emails_from_json_payload(page: object) -> list[str]:
+    try:
+        html = page.content()
+    except Exception:
+        html = ""
+
+    if not html:
+        return []
+
+    out: list[str] = []
+    patterns = (
+        r'"business_email"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+        r'"public_email"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+        r'"contact_email"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"',
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, html):
+            raw = match.group(1)
+            try:
+                decoded = bytes(raw, "utf-8").decode("unicode_escape")
+            except Exception:
+                decoded = raw
+            out.extend(_extract_emails(decoded))
+    return out
+
+
+def _extract_profile_email(page: object, biography: str | None) -> str | None:
+    collected: list[str] = []
+
+    collected.extend(_extract_profile_emails_from_json_payload(page))
+
+    collected.extend(_extract_emails(biography))
+
+    try:
+        header_text = page.locator("header").first.inner_text(timeout=1500)
+    except Exception:
+        header_text = None
+    collected.extend(_extract_emails(header_text))
+
+    try:
+        body_text = page.inner_text("body", timeout=1500)
+    except Exception:
+        body_text = None
+    collected.extend(_extract_emails(body_text))
+
+    try:
+        links = page.locator("header a[href^='mailto:']").all()
+    except Exception:
+        links = []
+
+    for link in links:
+        try:
+            href = (link.get_attribute("href") or "").strip()
+        except Exception:
+            href = ""
+        if not href:
+            continue
+        address = href.split("mailto:", 1)[-1].split("?", 1)[0].strip()
+        collected.extend(_extract_emails(address))
+
+    if not collected:
+        return None
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for email in collected:
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(email)
+
+    return ",".join(unique) if unique else None
+
+
 def _extract_primary_external_url(page: object) -> str | None:
     candidates = [
         "header a[href^='http']",
@@ -269,6 +364,93 @@ def _extract_primary_external_url(page: object) -> str | None:
     return dialog_urls[0] if dialog_urls else None
 
 
+def _unwrap_instagram_redirect(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+    host = (parsed.hostname or "").lower()
+    if host != "l.instagram.com":
+        return url
+    wrapped = (parse_qs(parsed.query).get("u") or [None])[0]
+    if not wrapped:
+        return url
+    unwrapped = unquote(wrapped)
+    return unwrapped if unwrapped.startswith(("http://", "https://")) else url
+
+
+def _canonicalize_external_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+
+    scheme = (parsed.scheme or "https").lower()
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return url
+
+    path = parsed.path or ""
+    if path == "/":
+        path = ""
+
+    tracking_keys = {
+        "fbclid",
+        "gclid",
+        "mc_cid",
+        "mc_eid",
+        "igshid",
+        "ig_rid",
+        "igsh",
+    }
+    filtered_pairs: list[tuple[str, str]] = []
+    for key, values in parse_qs(parsed.query, keep_blank_values=False).items():
+        k = (key or "").strip()
+        if not k:
+            continue
+        if k.lower().startswith("utm_") or k.lower() in tracking_keys:
+            continue
+        for value in values:
+            filtered_pairs.append((k, value))
+
+    query = urlencode(filtered_pairs, doseq=True)
+    return urlunparse((scheme, host, path, "", query, ""))
+
+
+def _nudge_page_interaction(page: object) -> None:
+    # Some anti-bot flows defer content until first input; send a harmless synthetic nudge.
+    try:
+        page.mouse.move(120, 140)
+        page.mouse.click(120, 140, delay=35)
+    except Exception:
+        pass
+
+
+def _navigate_profile(page: object, profile_url: str) -> None:
+    for _ in range(3):
+        try:
+            page.goto(profile_url, wait_until="domcontentloaded")
+            page.wait_for_timeout(700)
+            _nudge_page_interaction(page)
+            current = (page.url or "").lower()
+            if "instagram.com" in current and "about:blank" not in current:
+                return
+        except Exception:
+            pass
+
+        try:
+            page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
+            page.wait_for_timeout(450)
+            _nudge_page_interaction(page)
+        except Exception:
+            pass
+
+    # Last attempt should bubble failures to existing parse fallbacks.
+    page.goto(profile_url, wait_until="domcontentloaded")
+    page.wait_for_timeout(700)
+    _nudge_page_interaction(page)
+
+
 def _normalize_external_candidate(raw: str | None, base_url: str) -> str | None:
     if not raw:
         return None
@@ -284,6 +466,7 @@ def _normalize_external_candidate(raw: str | None, base_url: str) -> str | None:
     ):
         candidate = f"https://{candidate}"
 
+    candidate = _unwrap_instagram_redirect(candidate)
     absolute = urljoin(base_url, candidate)
     try:
         host = (urlparse(absolute).hostname or "").lower()
@@ -294,7 +477,7 @@ def _normalize_external_candidate(raw: str | None, base_url: str) -> str | None:
         return None
     if host in {"www.instagram.com", "instagram.com", "m.instagram.com"}:
         return None
-    return absolute
+    return _canonicalize_external_url(absolute)
 
 
 def _extract_external_urls_from_links_dialog(page: object, base_url: str) -> list[str]:
@@ -414,8 +597,8 @@ class ProfileScrapeResult:
 def scrape_profile_header(page: object, profile_url: str) -> ProfileScrapeResult:
     page_error_detected = False
     for _ in range(2):
-        page.goto(profile_url, wait_until="domcontentloaded")
-        page.wait_for_timeout(1500)
+        _navigate_profile(page, profile_url)
+        page.wait_for_timeout(800)
         if not _is_instagram_error_page(page):
             page_error_detected = False
             break
@@ -455,6 +638,7 @@ def scrape_profile_header(page: object, profile_url: str) -> ProfileScrapeResult
         "profile_url": profile_url,
         "full_name": _extract_full_name(page),
         "biography": _extract_biography(page),
+        "email_address": None,
         "external_url_primary": _extract_primary_external_url(page),
         "followers_count": followers_count
         if followers_count is not None
@@ -495,6 +679,10 @@ def scrape_profile_header(page: object, profile_url: str) -> ProfileScrapeResult
         profile_data["full_name"] = _extract_full_name_from_og_description(
             og_description
         )
+
+    profile_data["email_address"] = _extract_profile_email(
+        page, profile_data.get("biography")
+    )
 
     external_urls = _extract_all_external_urls(page, profile_url)
     if not profile_data["external_url_primary"] and external_urls:

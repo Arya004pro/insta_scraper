@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 from urllib.parse import quote
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
@@ -110,7 +111,7 @@ def _pick_sample(
         )
         has_full_parse = int(not (row.get("missing_reason_post") or "").strip())
         numeric_points = 0
-        for key in ("likes_count", "comments_count", "views_count"):
+        for key in ("likes_count", "comments_count", "views_count", "repost_count"):
             if (row.get(key) or "").strip():
                 numeric_points += 1
 
@@ -165,6 +166,7 @@ def _serialize_output_row(row: dict[str, str] | None) -> dict | None:
         "likes_count": row.get("likes_count"),
         "comments_count": row.get("comments_count"),
         "views_count": views_count,
+        "repost_count": row.get("repost_count"),
         "is_remix_repost": row.get("is_remix_repost"),
         "is_tagged_post": row.get("is_tagged_post"),
         "tagged_users_count": row.get("tagged_users_count"),
@@ -185,6 +187,41 @@ def _serialize_output_row(row: dict[str, str] | None) -> dict | None:
 def _serialize_external_links(
     links_rows: list[dict[str, str]], profile_row: dict[str, str] | None
 ) -> list[dict[str, str]]:
+    def _canonical_link(url: str) -> str:
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return url
+
+        scheme = (parsed.scheme or "https").lower()
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return url
+
+        path = parsed.path or ""
+        if path == "/":
+            path = ""
+
+        tracking_keys = {
+            "fbclid",
+            "gclid",
+            "mc_cid",
+            "mc_eid",
+            "igshid",
+            "ig_rid",
+            "igsh",
+        }
+        kept: list[tuple[str, str]] = []
+        for key, values in parse_qs(parsed.query, keep_blank_values=False).items():
+            lk = (key or "").lower()
+            if lk.startswith("utm_") or lk in tracking_keys:
+                continue
+            for value in values:
+                kept.append((key, value))
+
+        query = urlencode(kept, doseq=True)
+        return urlunparse((scheme, host, path, "", query, ""))
+
     seen: set[str] = set()
     output: list[dict[str, str]] = []
 
@@ -195,9 +232,10 @@ def _serialize_external_links(
         primary = final_url or expanded_url or raw_url
         if not _is_http_url(primary):
             continue
-        if primary in seen:
+        canonical_primary = _canonical_link(primary)
+        if canonical_primary in seen:
             continue
-        seen.add(primary)
+        seen.add(canonical_primary)
 
         output.append(
             {
@@ -233,6 +271,7 @@ def _profile_from_summary_row(summary_row: dict[str, str]) -> dict[str, str]:
     return {
         "username": summary_row.get("Username", ""),
         "full_name": summary_row.get("Full Name", ""),
+        "email_address": summary_row.get("Email Address", ""),
         "external_url_primary": summary_row.get("External URL (Primary)", ""),
         "followers_count": summary_row.get("Followers", ""),
         "following_count": summary_row.get("Following", ""),

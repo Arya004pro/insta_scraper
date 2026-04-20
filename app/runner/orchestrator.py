@@ -552,24 +552,31 @@ class RunOrchestrator:
         temp_profile_dir: Path | None = None
         effective_user_data_dir = source_user_data_dir
 
-        if self._is_camoufox_running():
-            if not self.settings.camoufox_clone_profile_when_running:
-                raise RuntimeError(
-                    "Camoufox appears to be running. Close it and retry, or enable CAMOUFOX_CLONE_PROFILE_WHEN_RUNNING=1"
-                )
-            try:
-                self.store.add_event(
-                    run_id,
-                    "Camoufox appears to be open. Cloning profile snapshot for scraping session.",
-                )
-                temp_profile_dir = self._clone_camoufox_profile_snapshot(
-                    run_id, source_user_data_dir
-                )
-                effective_user_data_dir = temp_profile_dir
-            except Exception as exc:
+        camoufox_running = self._is_camoufox_running()
+        if camoufox_running and not self.settings.camoufox_clone_profile_when_running:
+            raise RuntimeError(
+                "Camoufox appears to be running. Close it and retry, or enable CAMOUFOX_CLONE_PROFILE_WHEN_RUNNING=1"
+            )
+
+        try:
+            self.store.add_event(
+                run_id,
+                "Creating isolated browser profile snapshot for unattended scraping session.",
+            )
+            temp_profile_dir = self._clone_camoufox_profile_snapshot(
+                run_id, source_user_data_dir
+            )
+            effective_user_data_dir = temp_profile_dir
+        except Exception as exc:
+            if camoufox_running:
                 raise RuntimeError(
                     "Camoufox appears to be open and profile cloning failed. Close Camoufox or point CAMOUFOX_USER_DATA_DIR to a dedicated scraper profile."
                 ) from exc
+            self.store.add_event(
+                run_id,
+                f"Could not clone browser profile snapshot ({type(exc).__name__}); using source profile directly.",
+                level="warning",
+            )
 
         launch_kwargs: dict[str, Any] = {
             "headless": self.settings.browser_headless,
@@ -587,6 +594,10 @@ class RunOrchestrator:
                 "browser.sessionstore.resume_from_crash": False,
                 "browser.sessionstore.restore_on_demand": False,
                 "browser.sessionstore.max_resumed_crashes": 0,
+                "browser.shell.checkDefaultBrowser": False,
+                "browser.aboutwelcome.enabled": False,
+                "dom.webnotifications.enabled": False,
+                "permissions.default.desktop-notification": 2,
             },
         }
         if proxy:
@@ -656,7 +667,12 @@ class RunOrchestrator:
         def _score(row: dict[str, str]) -> tuple[int, int, int, int]:
             has_full_parse = int(not (row.get("missing_reason_post") or "").strip())
             numeric_count = 0
-            for key in ("likes_count", "comments_count", "views_count"):
+            for key in (
+                "likes_count",
+                "comments_count",
+                "views_count",
+                "repost_count",
+            ):
                 if (row.get(key) or "").strip():
                     numeric_count += 1
             has_caption = int(bool((row.get("caption_text") or "").strip()))
@@ -702,6 +718,7 @@ class RunOrchestrator:
         for key in (
             "media_type",
             "posted_at_ist",
+            "repost_count",
             "is_remix_repost",
             "is_tagged_post",
             "tagged_users_count",
@@ -876,7 +893,31 @@ class RunOrchestrator:
                     except Exception:
                         pass
             else:
-                page = ctx.new_page()
+                try:
+                    page = ctx.new_page()
+                except Exception:
+                    try:
+                        pages = [p for p in (ctx.pages or []) if not p.is_closed()]
+                    except Exception:
+                        pages = []
+                    if not pages:
+                        raise
+                    page = pages[0]
+
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
+
+            try:
+                page.goto(
+                    "https://www.instagram.com/",
+                    wait_until="domcontentloaded",
+                    timeout=20_000,
+                )
+                page.wait_for_timeout(max(500, self.settings.post_detail_wait_ms))
+            except Exception:
+                pass
 
             try:
                 page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
@@ -893,6 +934,16 @@ class RunOrchestrator:
         if proxy:
             self.store.update_run(run_id, proxy_id=proxy.proxy_id)
         self.store.add_event(run_id, f"Browser started for {profile_url}")
+        if self.settings.browser_headless:
+            self.store.add_event(
+                run_id,
+                "Background mode active (headless). Scraping continues without opening a visible browser window.",
+            )
+        else:
+            self.store.add_event(
+                run_id,
+                "Visible browser mode active. Camoufox opened automatically and scraping runs unattended while you spectate.",
+            )
 
         def _save_page_debug_artifacts(stage: str) -> dict[str, str | None]:
             debug_dir = self.settings.runs_dir / run_id / "debug"
@@ -1150,6 +1201,9 @@ class RunOrchestrator:
 
             discovered: list[dict[str, Any]] = []
             timeline_by_shortcode: dict[str, dict[str, Any]] = {}
+            reels_tab_by_shortcode: dict[str, dict[str, Any]] = {}
+            timeline_rank_by_shortcode: dict[str, int] = {}
+            pinned_shortcodes: set[str] = set()
             if self.settings.sample_collection_mode:
                 self.store.add_event(
                     run_id,
@@ -1201,6 +1255,11 @@ class RunOrchestrator:
                             profile_url,
                             wait_ms=max(1200, self.settings.post_detail_wait_ms * 3),
                         )
+                        reels_tab_by_shortcode = {
+                            str(item.get("shortcode")): item
+                            for item in reels_tab_items
+                            if item.get("shortcode")
+                        }
                         reels_views_by_shortcode = {
                             str(item.get("shortcode")): item.get("views_count")
                             for item in reels_tab_items
@@ -1218,128 +1277,88 @@ class RunOrchestrator:
                                 )
                                 if isinstance(views, int):
                                     item["views_count"] = views
+                                reel_tab_item = (
+                                    reels_tab_by_shortcode.get(
+                                        str(item.get("shortcode"))
+                                    )
+                                    or {}
+                                )
+                                if not isinstance(item.get("repost_count"), int):
+                                    reposts = reel_tab_item.get("repost_count")
+                                    if isinstance(reposts, int):
+                                        item["repost_count"] = reposts
                     except Exception:
                         pass
 
-                for item in timeline_items:
-                    if all(sample_captured[b] for b in required_samples):
-                        break
-                    shortcode = item.get("shortcode")
-                    if not shortcode or shortcode in processed:
-                        continue
+                if timeline_items:
 
-                    sample_bucket = item.get(
-                        "sample_bucket"
-                    ) or self._sample_bucket_for_media_type(item.get("media_type"))
-                    if sample_bucket not in sample_captured or sample_captured.get(
-                        sample_bucket
-                    ):
-                        continue
+                    def _epoch(item: dict[str, Any]) -> int:
+                        value = item.get("taken_at_epoch")
+                        if isinstance(value, int):
+                            return value
+                        posted = item.get("posted_at_ist")
+                        if isinstance(posted, str) and posted.strip():
+                            try:
+                                return int(datetime.fromisoformat(posted).timestamp())
+                            except Exception:
+                                return 0
+                        return 0
 
-                    if sample_bucket == "reels" and not isinstance(
-                        item.get("views_count"), int
-                    ):
-                        continue
+                    ordered_timeline = sorted(timeline_items, key=_epoch, reverse=True)
+                    rank = 0
+                    for item in ordered_timeline:
+                        shortcode = str(item.get("shortcode") or "").strip()
+                        if not shortcode:
+                            continue
+                        if bool(item.get("is_pinned")):
+                            pinned_shortcodes.add(shortcode)
+                            continue
+                        if shortcode not in timeline_rank_by_shortcode:
+                            timeline_rank_by_shortcode[shortcode] = rank
+                            rank += 1
 
-                    media_asset_urls = [
-                        x
-                        for x in (item.get("media_asset_urls") or [])
-                        if isinstance(x, str) and x
-                    ]
-                    if not media_asset_urls:
-                        continue
-
-                    media_asset_local_paths = self._download_sample_media_assets(
-                        run_id=run_id,
-                        username=username,
-                        full_name=profile_row.get("full_name"),
-                        sample_bucket=sample_bucket,
-                        shortcode=shortcode,
-                        media_asset_urls=media_asset_urls,
-                    )
-                    if media_asset_local_paths:
-                        self._append_sample_manifest(
-                            username=username,
-                            full_name=profile_row.get("full_name"),
-                            sample_bucket=sample_bucket,
-                            shortcode=shortcode,
-                            post_url=item.get("post_url") or "",
-                            media_asset_urls=media_asset_urls,
-                            media_asset_local_paths=media_asset_local_paths,
+                    if timeline_rank_by_shortcode:
+                        self.store.add_event(
+                            run_id,
+                            f"Timeline ordering captured for {len(timeline_rank_by_shortcode)} non-pinned posts/reels.",
+                        )
+                    if pinned_shortcodes:
+                        self.store.add_event(
+                            run_id,
+                            f"Ignoring {len(pinned_shortcodes)} pinned timeline items for sample-mode latest selection.",
                         )
 
-                    row = {
-                        "scraped_at_ist": scraped_at,
-                        "run_id": run_id,
-                        "username": username,
-                        "shortcode": shortcode,
-                        "post_url": item.get("post_url"),
-                        "media_type": item.get("media_type"),
-                        "posted_at_ist": item.get("posted_at_ist"),
-                        "likes_count": item.get("likes_count"),
-                        "comments_count": item.get("comments_count"),
-                        "views_count": item.get("views_count")
-                        if item.get("media_type") == "reel"
-                        else None,
-                        "is_remix_repost": item.get("is_remix_repost"),
-                        "is_tagged_post": item.get("is_tagged_post"),
-                        "tagged_users_count": item.get("tagged_users_count"),
-                        "hashtags_csv": item.get("hashtags_csv"),
-                        "keywords_csv": item.get("keywords_csv"),
-                        "mentions_csv": item.get("mentions_csv"),
-                        "caption_text": item.get("caption_text"),
-                        "location_name": item.get("location_name"),
-                        "media_asset_urls_csv": ",".join(media_asset_urls),
-                        "media_asset_local_paths_csv": ",".join(media_asset_local_paths)
-                        if media_asset_local_paths
-                        else None,
-                        "sample_bucket": sample_bucket,
-                        "missing_reason_post": None,
-                    }
-                    posts_rows.append({k: row.get(k) for k in POSTS_COLUMNS})
-                    processed.add(shortcode)
-                    sample_captured[sample_bucket] = True
-                    self.store.add_event(
-                        run_id,
-                        f"Sample captured from timeline: {sample_bucket} ({shortcode})",
-                    )
-
-                if not all(sample_captured[b] for b in required_samples):
-                    self.store.add_event(
-                        run_id,
-                        "Sample mode fallback: scanning only currently visible grid posts (no deep scroll).",
-                        level="warning",
-                    )
-                    try:
+                self.store.add_event(
+                    run_id,
+                    "Sample mode fallback: scanning only currently visible grid posts (no deep scroll).",
+                    level="warning",
+                )
+                try:
+                    page.goto(profile_url, wait_until="domcontentloaded")
+                    page.wait_for_timeout(max(300, self.settings.post_detail_wait_ms))
+                except Exception as exc:
+                    if self._is_closed_context_error(exc):
+                        _relaunch_browser_session(
+                            "Relaunching browser session before sample-mode visible grid scan"
+                        )
                         page.goto(profile_url, wait_until="domcontentloaded")
                         page.wait_for_timeout(
                             max(300, self.settings.post_detail_wait_ms)
                         )
-                    except Exception as exc:
-                        if self._is_closed_context_error(exc):
-                            _relaunch_browser_session(
-                                "Relaunching browser session before sample-mode visible grid scan"
-                            )
-                            page.goto(profile_url, wait_until="domcontentloaded")
-                            page.wait_for_timeout(
-                                max(300, self.settings.post_detail_wait_ms)
-                            )
-                    visible_scan_settings = replace(self.settings, scroll_idle_rounds=0)
-                    discovered = enumerate_grid_posts(
-                        page,
-                        visible_scan_settings,
-                        resume_state=resume_state,
-                        media_filter="posts",
-                    )
-                    if (
-                        self.settings.max_posts_per_profile
-                        and self.settings.max_posts_per_profile > 0
-                    ):
-                        discovered = discovered[: self.settings.max_posts_per_profile]
-                    else:
-                        discovered = discovered[:30]
+                visible_scan_settings = replace(self.settings, scroll_idle_rounds=0)
+                discovered = enumerate_grid_posts(
+                    page,
+                    visible_scan_settings,
+                    resume_state=resume_state,
+                    media_filter="posts",
+                )
+                if (
+                    self.settings.max_posts_per_profile
+                    and self.settings.max_posts_per_profile > 0
+                ):
+                    discovered = discovered[: self.settings.max_posts_per_profile]
                 else:
-                    discovered = []
+                    discovered = discovered[:30]
             else:
                 enum_attempts = 0
                 last_enum_error: Exception | None = None
@@ -1408,10 +1427,14 @@ class RunOrchestrator:
 
                     for key in (
                         "media_type_hint",
+                        "posted_at_ist",
+                        "taken_at_epoch",
+                        "is_pinned",
                         "thumbnail_url",
                         "likes_count",
                         "comments_count",
                         "views_count",
+                        "repost_count",
                     ):
                         if existing.get(key) in {None, ""} and row.get(key) not in {
                             None,
@@ -1442,14 +1465,48 @@ class RunOrchestrator:
                         "shortcode": row.get("shortcode"),
                         "post_url": row.get("post_url"),
                         "media_type_hint": "reel",
+                        "posted_at_ist": row.get("posted_at_ist"),
+                        "taken_at_epoch": row.get("taken_at_epoch"),
+                        "is_pinned": row.get("is_pinned"),
                         "thumbnail_url": row.get("thumbnail_url"),
                         "likes_count": row.get("likes_count"),
                         "comments_count": row.get("comments_count"),
                         "views_count": row.get("views_count"),
+                        "repost_count": row.get("repost_count"),
                     }
                     for row in reels_from_graphql
                     if row.get("shortcode")
                 ]
+
+                for row in reels_from_graphql:
+                    shortcode = str(row.get("shortcode") or "").strip()
+                    if not shortcode:
+                        continue
+                    existing = reels_tab_by_shortcode.get(shortcode)
+                    if existing is None:
+                        reels_tab_by_shortcode[shortcode] = row
+                    else:
+                        for key in (
+                            "posted_at_ist",
+                            "taken_at_epoch",
+                            "likes_count",
+                            "comments_count",
+                            "views_count",
+                            "repost_count",
+                            "thumbnail_url",
+                            "media_asset_urls",
+                        ):
+                            if existing.get(key) in {None, ""} and row.get(key) not in {
+                                None,
+                                "",
+                            }:
+                                existing[key] = row.get(key)
+
+                for row in reels_discovered:
+                    if bool(row.get("is_pinned")):
+                        shortcode = str(row.get("shortcode") or "").strip()
+                        if shortcode:
+                            pinned_shortcodes.add(shortcode)
 
                 if not reels_discovered:
                     reels_url = f"{profile_url.rstrip('/')}/reels/"
@@ -1487,6 +1544,47 @@ class RunOrchestrator:
                 mixed_posts_discovered, reels_discovered
             )
 
+            if timeline_by_shortcode and discovered:
+                for item in discovered:
+                    shortcode = str(item.get("shortcode") or "").strip()
+                    if not shortcode:
+                        continue
+                    timeline_item = timeline_by_shortcode.get(shortcode) or {}
+                    for key in (
+                        "posted_at_ist",
+                        "taken_at_epoch",
+                        "is_pinned",
+                        "repost_count",
+                        "likes_count",
+                        "comments_count",
+                        "views_count",
+                    ):
+                        if item.get(key) in {None, ""} and timeline_item.get(
+                            key
+                        ) not in {None, ""}:
+                            item[key] = timeline_item.get(key)
+
+            if reels_tab_by_shortcode and discovered:
+                for item in discovered:
+                    shortcode = str(item.get("shortcode") or "").strip()
+                    if not shortcode:
+                        continue
+                    reel_item = reels_tab_by_shortcode.get(shortcode) or {}
+                    for key in (
+                        "posted_at_ist",
+                        "taken_at_epoch",
+                        "likes_count",
+                        "comments_count",
+                        "views_count",
+                        "repost_count",
+                        "thumbnail_url",
+                    ):
+                        if item.get(key) in {None, ""} and reel_item.get(key) not in {
+                            None,
+                            "",
+                        }:
+                            item[key] = reel_item.get(key)
+
             self.store.add_event(run_id, f"Discovered {len(discovered)} posts + reels")
             grid_challenge_cleared = _check_challenge_with_recovery(
                 {
@@ -1500,6 +1598,15 @@ class RunOrchestrator:
                 discovered = []
 
             if self.settings.sample_collection_mode and discovered:
+                if pinned_shortcodes:
+                    non_pinned = [
+                        item
+                        for item in discovered
+                        if str(item.get("shortcode") or "") not in pinned_shortcodes
+                    ]
+                    if non_pinned:
+                        discovered = non_pinned
+
                 priority_map: dict[str, int] = {}
                 rank = 0
                 if not sample_captured["posts"]:
@@ -1509,20 +1616,40 @@ class RunOrchestrator:
                     priority_map["reels"] = rank
                     rank += 1
 
+                def _candidate_epoch(item: dict[str, Any]) -> int:
+                    epoch = item.get("taken_at_epoch")
+                    if isinstance(epoch, int):
+                        return epoch
+                    posted = item.get("posted_at_ist")
+                    if isinstance(posted, str) and posted.strip():
+                        try:
+                            return int(datetime.fromisoformat(posted).timestamp())
+                        except Exception:
+                            return 0
+                    return 0
+
                 default_rank = 99
                 discovered = sorted(
                     discovered,
-                    key=lambda item: priority_map.get(
-                        self._sample_bucket_for_media_type(
-                            (
-                                recent_post_cache.get(str(item.get("shortcode"))) or {}
-                            ).get("media_type")
-                        )
-                        or self._sample_bucket_for_media_type(
-                            item.get("media_type_hint")
-                        )
-                        or "",
-                        default_rank,
+                    key=lambda item: (
+                        priority_map.get(
+                            self._sample_bucket_for_media_type(
+                                (
+                                    recent_post_cache.get(str(item.get("shortcode")))
+                                    or {}
+                                ).get("media_type")
+                            )
+                            or self._sample_bucket_for_media_type(
+                                item.get("media_type_hint")
+                            )
+                            or "",
+                            default_rank,
+                        ),
+                        timeline_rank_by_shortcode.get(
+                            str(item.get("shortcode") or ""),
+                            999_999,
+                        ),
+                        -_candidate_epoch(item),
                     ),
                 )
 
@@ -1532,6 +1659,7 @@ class RunOrchestrator:
                 if not shortcode or shortcode in processed:
                     continue
                 timeline_fallback = timeline_by_shortcode.get(str(shortcode), {})
+                reels_tab_fallback = reels_tab_by_shortcode.get(str(shortcode), {})
 
                 if self.settings.sample_collection_mode:
                     if all(sample_captured[b] for b in required_samples):
@@ -1598,10 +1726,41 @@ class RunOrchestrator:
                             post_comments = post.get("comments_count")
                             if isinstance(post_comments, int):
                                 detail["comments_count"] = post_comments
+                        if detail.get("repost_count") is None:
+                            timeline_reposts = timeline_fallback.get("repost_count")
+                            if isinstance(timeline_reposts, int):
+                                detail["repost_count"] = timeline_reposts
+                        if detail.get("repost_count") is None:
+                            reels_tab_reposts = reels_tab_fallback.get("repost_count")
+                            if isinstance(reels_tab_reposts, int):
+                                detail["repost_count"] = reels_tab_reposts
+                        if detail.get("repost_count") is None:
+                            grid_reposts = post.get("repost_count")
+                            if isinstance(grid_reposts, int):
+                                detail["repost_count"] = grid_reposts
+                        if not detail.get("posted_at_ist") and timeline_fallback.get(
+                            "posted_at_ist"
+                        ):
+                            detail["posted_at_ist"] = timeline_fallback.get(
+                                "posted_at_ist"
+                            )
+                        for key in (
+                            "hashtags_csv",
+                            "keywords_csv",
+                            "mentions_csv",
+                            "caption_text",
+                            "location_name",
+                        ):
+                            if not detail.get(key) and timeline_fallback.get(key):
+                                detail[key] = timeline_fallback.get(key)
                         if detail.get("views_count") is None:
                             timeline_views = timeline_fallback.get("views_count")
                             if isinstance(timeline_views, int):
                                 detail["views_count"] = timeline_views
+                        if detail.get("views_count") is None:
+                            reels_tab_views = reels_tab_fallback.get("views_count")
+                            if isinstance(reels_tab_views, int):
+                                detail["views_count"] = reels_tab_views
                         if detail.get("views_count") is None:
                             grid_views = post.get("views_count")
                             if isinstance(grid_views, int):
@@ -1873,6 +2032,20 @@ class RunOrchestrator:
                         ("http://", "https://")
                     ):
                         fallback_remote_urls.append(thumbnail_url)
+                    if not fallback_remote_urls:
+                        fallback_remote_urls = [
+                            x
+                            for x in (timeline_fallback.get("media_asset_urls") or [])
+                            if isinstance(x, str)
+                            and x.startswith(("http://", "https://"))
+                        ]
+                    if not fallback_remote_urls:
+                        fallback_remote_urls = [
+                            x
+                            for x in (reels_tab_fallback.get("media_asset_urls") or [])
+                            if isinstance(x, str)
+                            and x.startswith(("http://", "https://"))
+                        ]
 
                     fallback_sample_bucket: str | None = None
                     fallback_local_paths: list[str] = []
@@ -1916,6 +2089,11 @@ class RunOrchestrator:
 
                     fallback_views_count = timeline_fallback.get("views_count")
                     if not isinstance(fallback_views_count, int):
+                        tab_views = reels_tab_fallback.get("views_count")
+                        fallback_views_count = (
+                            tab_views if isinstance(tab_views, int) else None
+                        )
+                    if not isinstance(fallback_views_count, int):
                         post_views = post.get("views_count")
                         fallback_views_count = (
                             post_views if isinstance(post_views, int) else None
@@ -1933,6 +2111,18 @@ class RunOrchestrator:
                         else None
                     )
 
+                    fallback_repost_count = timeline_fallback.get("repost_count")
+                    if not isinstance(fallback_repost_count, int):
+                        tab_reposts = reels_tab_fallback.get("repost_count")
+                        fallback_repost_count = (
+                            tab_reposts if isinstance(tab_reposts, int) else None
+                        )
+                    if not isinstance(fallback_repost_count, int):
+                        post_reposts = post.get("repost_count")
+                        fallback_repost_count = (
+                            post_reposts if isinstance(post_reposts, int) else None
+                        )
+
                     fallback_media_type = cached_media_type or post.get(
                         "media_type_hint"
                     )
@@ -1946,18 +2136,21 @@ class RunOrchestrator:
                         "shortcode": shortcode,
                         "post_url": post["post_url"],
                         "media_type": fallback_media_type,
-                        "posted_at_ist": None,
+                        "posted_at_ist": timeline_fallback.get("posted_at_ist"),
                         "likes_count": fallback_likes_count,
                         "comments_count": fallback_comments_count,
                         "views_count": fallback_views_count,
-                        "is_remix_repost": None,
-                        "is_tagged_post": None,
-                        "tagged_users_count": None,
-                        "hashtags_csv": None,
-                        "keywords_csv": None,
-                        "mentions_csv": None,
-                        "caption_text": None,
-                        "location_name": None,
+                        "repost_count": fallback_repost_count,
+                        "is_remix_repost": timeline_fallback.get("is_remix_repost"),
+                        "is_tagged_post": timeline_fallback.get("is_tagged_post"),
+                        "tagged_users_count": timeline_fallback.get(
+                            "tagged_users_count"
+                        ),
+                        "hashtags_csv": timeline_fallback.get("hashtags_csv"),
+                        "keywords_csv": timeline_fallback.get("keywords_csv"),
+                        "mentions_csv": timeline_fallback.get("mentions_csv"),
+                        "caption_text": timeline_fallback.get("caption_text"),
+                        "location_name": timeline_fallback.get("location_name"),
                         "media_asset_urls_csv": ",".join(fallback_remote_urls)
                         if fallback_remote_urls
                         else None,
@@ -2004,12 +2197,11 @@ class RunOrchestrator:
                 and timeline_items
                 and len(posts_rows) < 3
             ):
-                backfilled = 0
-                for bucket in ("posts", "reels"):
-                    _check_cancel()
-                    if sample_captured[bucket]:
-                        continue
-                    candidate = next(
+
+                def _pick_timeline_candidate(
+                    bucket: str, include_pinned: bool
+                ) -> dict[str, Any] | None:
+                    return next(
                         (
                             item
                             for item in timeline_items
@@ -2022,8 +2214,22 @@ class RunOrchestrator:
                                 )
                             )
                             == bucket
+                            and (include_pinned or not bool(item.get("is_pinned")))
                         ),
                         None,
+                    )
+
+                backfilled = 0
+                for bucket in ("posts", "reels"):
+                    _check_cancel()
+                    if sample_captured[bucket]:
+                        continue
+                    candidate = _pick_timeline_candidate(
+                        bucket=bucket,
+                        include_pinned=False,
+                    ) or _pick_timeline_candidate(
+                        bucket=bucket,
+                        include_pinned=True,
                     )
                     if not candidate:
                         continue
@@ -2052,6 +2258,7 @@ class RunOrchestrator:
                         "views_count": candidate.get("views_count")
                         if candidate.get("media_type") == "reel"
                         else None,
+                        "repost_count": candidate.get("repost_count"),
                         "is_remix_repost": candidate.get("is_remix_repost"),
                         "is_tagged_post": candidate.get("is_tagged_post"),
                         "tagged_users_count": candidate.get("tagged_users_count"),
@@ -2155,6 +2362,13 @@ class RunOrchestrator:
                         )
                         if media_type_hint == "reel"
                         else None,
+                        "repost_count": (
+                            timeline_candidate.get("repost_count")
+                            if isinstance(timeline_candidate.get("repost_count"), int)
+                            else candidate.get("repost_count")
+                            if isinstance(candidate.get("repost_count"), int)
+                            else None
+                        ),
                         "is_remix_repost": timeline_candidate.get("is_remix_repost"),
                         "is_tagged_post": timeline_candidate.get("is_tagged_post"),
                         "tagged_users_count": timeline_candidate.get(
@@ -2204,7 +2418,12 @@ class RunOrchestrator:
                         not bool((row.get("missing_reason_post") or "").strip())
                     )
                     numeric_count = 0
-                    for field in ("likes_count", "comments_count", "views_count"):
+                    for field in (
+                        "likes_count",
+                        "comments_count",
+                        "views_count",
+                        "repost_count",
+                    ):
                         value = row.get(field)
                         if isinstance(value, int):
                             numeric_count += 1

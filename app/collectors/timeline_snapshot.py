@@ -12,6 +12,46 @@ HASHTAG_RE = re.compile(r"#([A-Za-z0-9_]+)")
 MENTION_RE = re.compile(r"@([A-Za-z0-9._]+)")
 
 
+def _to_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _extract_repost_count(node: dict[str, Any]) -> int | None:
+    candidates = [
+        node.get("repost_count"),
+        node.get("media_repost_count"),
+        node.get("reshare_count"),
+        node.get("share_count"),
+    ]
+    clips = node.get("clips_metadata")
+    if isinstance(clips, dict):
+        candidates.extend(
+            [
+                clips.get("repost_count"),
+                clips.get("reshare_count"),
+                clips.get("share_count"),
+            ]
+        )
+
+    for candidate in candidates:
+        value = _to_int(candidate)
+        if value is not None:
+            return value
+    return None
+
+
+def _is_pinned_node(node: dict[str, Any]) -> bool:
+    return bool(
+        node.get("is_pinned")
+        or node.get("is_pinned_for_users")
+        or node.get("pinned_for_users")
+        or node.get("pinned_for_clips_tabs")
+    )
+
+
 def _to_iso_ist_from_epoch(value: Any) -> str | None:
     try:
         ts = int(value)
@@ -219,15 +259,20 @@ def collect_recent_timeline_items(
             else f"https://www.instagram.com/p/{shortcode}/"
         )
 
+        taken_at_epoch = _to_int(node.get("taken_at"))
+
         result = {
             "shortcode": shortcode,
             "post_url": post_url,
             "media_type": media_type,
             "sample_bucket": bucket,
+            "taken_at_epoch": taken_at_epoch,
             "posted_at_ist": _to_iso_ist_from_epoch(node.get("taken_at")),
             "likes_count": node.get("like_count"),
             "comments_count": node.get("comment_count"),
             "views_count": node.get("view_count") or node.get("play_count"),
+            "repost_count": _extract_repost_count(node),
+            "is_pinned": _is_pinned_node(node),
             "is_remix_repost": bool(
                 re.search(r"\bremix\b|\brepost\b", caption or "", re.IGNORECASE)
             ),
@@ -307,6 +352,12 @@ def collect_recent_reels_tab_items(
         except Exception:
             views_count = None
 
+        repost_count = _extract_repost_count(media)
+        if repost_count is None:
+            repost_count = _extract_repost_count(node)
+
+        taken_at_epoch = _to_int(media.get("taken_at"))
+
         try:
             likes_count = int(media.get("like_count"))
         except Exception:
@@ -328,10 +379,13 @@ def collect_recent_reels_tab_items(
                 "post_url": f"https://www.instagram.com/reel/{shortcode}/",
                 "media_type": "reel",
                 "sample_bucket": "reels",
+                "taken_at_epoch": taken_at_epoch,
                 "posted_at_ist": _to_iso_ist_from_epoch(media.get("taken_at")),
                 "likes_count": likes_count,
                 "comments_count": comments_count,
                 "views_count": views_count,
+                "repost_count": repost_count,
+                "is_pinned": _is_pinned_node(media) or _is_pinned_node(node),
                 "thumbnail_url": image_url,
                 "media_asset_urls": [image_url] if image_url else [],
             }

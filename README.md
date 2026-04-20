@@ -76,7 +76,9 @@ set CHALLENGE_AUTO_RETRY_ATTEMPTS=3
 set CHALLENGE_AUTO_RETRY_WAIT_SECONDS=8
 ```
 
-Optional headless mode:
+Default mode opens a visible browser window (headed mode), so you can spectate while scraping continues automatically.
+
+Optional headless mode (hide browser window):
 
 ```bash
 set BROWSER_HEADLESS=1

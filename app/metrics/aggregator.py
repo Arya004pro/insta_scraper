@@ -220,6 +220,7 @@ def build_summary_flat(
         "Profile URL": profile_row.get("profile_url"),
         "Full Name": profile_row.get("full_name"),
         "Biography": profile_row.get("biography"),
+        "Email Address": profile_row.get("email_address"),
         "External URL (Primary)": profile_row.get("external_url_primary"),
         "Followers": profile_row.get("followers_count"),
         "Following": profile_row.get("following_count"),

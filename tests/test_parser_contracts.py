@@ -2,6 +2,7 @@ from app.collectors.about_scraper import _extract_by_label, _extract_following_l
 from app.collectors.grid_enumerator import extract_media_links_from_html
 from app.collectors.post_detail_scraper import (
     _extract_like_comment_from_json_payload,
+    _extract_repost_count_from_json_payload,
     _extract_views_from_json_payload,
     _parse_counts_from_text,
 )
@@ -109,6 +110,16 @@ def test_extract_like_comment_from_json_payload_contract():
     )
     assert likes == 656
     assert comments == 82
+
+
+class _MockPageJsonRepost:
+    def content(self) -> str:
+        return '{"items":[{"code":"RS123","media_repost_count":431}]}'
+
+
+def test_extract_repost_count_from_json_payload_contract():
+    reposts = _extract_repost_count_from_json_payload(_MockPageJsonRepost(), "RS123")
+    assert reposts == 431
 
 
 def test_profile_og_count_parser_contract():

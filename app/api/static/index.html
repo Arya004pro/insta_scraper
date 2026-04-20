@@ -371,13 +371,13 @@
       const rows = [
         ["Username", profile.username],
         ["Full Name", profile.full_name],
+        ["Email Address", profile.email_address],
         ["Followers", formatCount(profile.followers_count)],
         ["Following", formatCount(profile.following_count)],
         ["Posts", formatCount(profile.total_posts_count)],
         ["Date Joined", profile.date_joined],
         ["Based In", profile.account_based_in],
         ["Verified Time", profile.time_verified],
-        ["Provided Primary Link", profile.external_url_primary],
         ["Active Ads", profile.active_ads_status],
         ["Active Ads URL", profile.active_ads_url],
       ];
@@ -402,6 +402,7 @@
             <tr><th>Likes</th><td>${esc(item.likes_count)}</td></tr>
             <tr><th>Comments</th><td>${esc(item.comments_count)}</td></tr>
             ${viewsRow}
+            <tr><th>Reposts</th><td>${esc(item.repost_count || "")}</td></tr>
             <tr><th>Hashtags</th><td>${esc(item.hashtags_csv || "")}</td></tr>
             <tr><th>Keywords</th><td>${esc(item.keywords_csv || "")}</td></tr>
             <tr><th>Mentions</th><td>${esc(item.mentions_csv || "")}</td></tr>
@@ -478,6 +479,7 @@
             <tr><th>Likes</th><td>${esc(item.likes_count || "")}</td></tr>
             <tr><th>Comments</th><td>${esc(item.comments_count || "")}</td></tr>
             ${viewsRow}
+            <tr><th>Reposts</th><td>${esc(item.repost_count || "")}</td></tr>
             <tr><th>Tagged Users</th><td>${esc(item.tagged_users_count || "")}</td></tr>
             <tr><th>Hashtags</th><td>${esc(item.hashtags_csv || "")}</td></tr>
             <tr><th>Keywords</th><td>${esc(item.keywords_csv || "")}</td></tr>

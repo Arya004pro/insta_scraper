@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
-from datetime import timezone
+from datetime import datetime, timezone
 
 from dateutil import parser as date_parser
 
@@ -105,6 +106,96 @@ def _parse_counts_from_text(text: str) -> tuple[int | None, int | None, int | No
     return likes, comments, views
 
 
+def _parse_repost_count_from_text(text: str) -> int | None:
+    if not text:
+        return None
+    match = re.search(
+        r"([\d,.]+[kmb]?)\s+(?:reposts?|reshares?|shares?)\b", text, re.IGNORECASE
+    )
+    if not match:
+        return None
+    return _to_int(match.group(1))
+
+
+def _json_unescape(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    try:
+        return json.loads(f'"{raw}"')
+    except Exception:
+        return raw
+
+
+def _shortcode_scopes(page: object, shortcode: str) -> list[str]:
+    try:
+        html = page.content()
+    except Exception:
+        html = ""
+
+    if not html:
+        return []
+
+    scopes: list[str] = []
+    token = f'"code":"{shortcode}"'
+    idx = html.find(token)
+    if idx >= 0:
+        start = max(0, idx - 12000)
+        end = min(len(html), idx + 50000)
+        scopes.append(html[start:end])
+    scopes.append(html)
+    return scopes
+
+
+def _extract_caption_from_json_payload(page: object, shortcode: str) -> str | None:
+    patterns = [
+        r'"caption"\s*:\s*\{"text"\s*:\s*"((?:\\.|[^"\\])*)"',
+        r'"edge_media_to_caption".{0,1200}?"text"\s*:\s*"((?:\\.|[^"\\])*)"',
+    ]
+    for scope in _shortcode_scopes(page, shortcode):
+        for pattern in patterns:
+            match = re.search(pattern, scope)
+            if not match:
+                continue
+            value = (_json_unescape(match.group(1)) or "").strip()
+            if value:
+                return value
+    return None
+
+
+def _extract_location_from_json_payload(page: object, shortcode: str) -> str | None:
+    pattern = r'"location"\s*:\s*\{[^{}]{0,1200}?"name"\s*:\s*"((?:\\.|[^"\\])*)"'
+    for scope in _shortcode_scopes(page, shortcode):
+        match = re.search(pattern, scope)
+        if not match:
+            continue
+        value = (_json_unescape(match.group(1)) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _extract_posted_time_from_json_payload(page: object, shortcode: str) -> str | None:
+    patterns = [
+        r'"taken_at"\s*:\s*([0-9]{9,})',
+        r'"taken_at_timestamp"\s*:\s*([0-9]{9,})',
+    ]
+    for scope in _shortcode_scopes(page, shortcode):
+        for pattern in patterns:
+            match = re.search(pattern, scope)
+            if not match:
+                continue
+            try:
+                ts = int(match.group(1))
+                return (
+                    datetime.fromtimestamp(ts, tz=timezone.utc)
+                    .astimezone(IST)
+                    .isoformat()
+                )
+            except Exception:
+                continue
+    return None
+
+
 def _extract_views_from_json_payload(page: object, shortcode: str) -> int | None:
     try:
         html = page.content()
@@ -133,6 +224,26 @@ def _extract_views_from_json_payload(page: object, shortcode: str) -> int | None
                 value = _to_int(raw) if raw else None
                 if value is not None:
                     return value
+
+        # Instagram payload keys vary across surfaces. Fall back to any
+        # count-like metric key containing "view" or "play" near this shortcode.
+        candidates: list[int] = []
+        generic_pattern = (
+            r'"([A-Za-z0-9_]*(?:view|play)[A-Za-z0-9_]*)"\s*:\s*'
+            r'(?:"([^"]+)"|([0-9][0-9,\.]*[kmbKMB]?))'
+        )
+        for match in re.finditer(generic_pattern, scope, re.IGNORECASE):
+            metric_key = (match.group(1) or "").lower()
+            if "count" not in metric_key and not metric_key.endswith(
+                ("views", "plays")
+            ):
+                continue
+            raw = match.group(2) or match.group(3)
+            value = _to_int(raw) if raw else None
+            if isinstance(value, int) and value > 0:
+                candidates.append(value)
+        if candidates:
+            return max(candidates)
     return None
 
 
@@ -190,6 +301,42 @@ def _extract_like_comment_from_json_payload(
             break
 
     return likes, comments
+
+
+def _extract_repost_count_from_json_payload(page: object, shortcode: str) -> int | None:
+    try:
+        html = page.content()
+    except Exception:
+        return None
+
+    if not html:
+        return None
+
+    scopes: list[str] = []
+    token = f'"code":"{shortcode}"'
+    idx = html.find(token)
+    if idx >= 0:
+        start = max(0, idx - 8000)
+        end = min(len(html), idx + 30000)
+        scopes.append(html[start:end])
+    scopes.append(html)
+
+    patterns = [
+        r'"repost_count"\s*:\s*(?:"([^"]+)"|([0-9][0-9,\.]*)|null)',
+        r'"media_repost_count"\s*:\s*(?:"([^"]+)"|([0-9][0-9,\.]*)|null)',
+        r'"reshare_count"\s*:\s*(?:"([^"]+)"|([0-9][0-9,\.]*)|null)',
+        r'"share_count"\s*:\s*(?:"([^"]+)"|([0-9][0-9,\.]*)|null)',
+    ]
+    for scope in scopes:
+        for pattern in patterns:
+            match = re.search(pattern, scope)
+            if not match:
+                continue
+            raw = match.group(1) or match.group(2)
+            value = _to_int(raw) if raw else None
+            if value is not None:
+                return value
+    return None
 
 
 def _extract_caption(page: object) -> str | None:
@@ -451,6 +598,10 @@ def scrape_post_detail(
 
     shortcode = post_url.rstrip("/").split("/")[-1]
 
+    posted_at_ist = _extract_posted_time_ist(page)
+    if not posted_at_ist:
+        posted_at_ist = _extract_posted_time_from_json_payload(page, shortcode)
+
     media_type = media_type_hint or ("reel" if "/reel/" in post_url else "image_post")
     if media_type == "image_post":
         try:
@@ -474,9 +625,17 @@ def scrape_post_detail(
         ] or media_asset_urls
 
     caption = _extract_caption(page)
+    if not caption:
+        caption = _extract_caption_from_json_payload(page, shortcode)
+
+    location_name = _extract_location(page)
+    if not location_name:
+        location_name = _extract_location_from_json_payload(page, shortcode)
+
     og_description = _extract_og_description(page)
     parse_text = " ".join([x for x in [caption, og_description] if x]) or ""
     likes_count, comments_count, views_count = _parse_counts_from_text(parse_text)
+    repost_count = _parse_repost_count_from_text(parse_text)
 
     json_likes, json_comments = _extract_like_comment_from_json_payload(page, shortcode)
     if json_likes is not None:
@@ -491,11 +650,19 @@ def scrape_post_detail(
             likes_count = likes_count if likes_count is not None else l2
             comments_count = comments_count if comments_count is not None else c2
             views_count = views_count if views_count is not None else v2
+            repost_count = (
+                repost_count
+                if repost_count is not None
+                else _parse_repost_count_from_text(body)
+            )
         except Exception:
             pass
 
     if views_count is None:
         views_count = _extract_views_from_json_payload(page, shortcode)
+
+    if repost_count is None:
+        repost_count = _extract_repost_count_from_json_payload(page, shortcode)
 
     hashtags = HASHTAG_RE.findall(caption or "")
     mentions = MENTION_RE.findall(caption or "")
@@ -516,10 +683,11 @@ def scrape_post_detail(
         "shortcode": shortcode,
         "post_url": post_url,
         "media_type": media_type,
-        "posted_at_ist": _extract_posted_time_ist(page),
+        "posted_at_ist": posted_at_ist,
         "likes_count": likes_count,
         "comments_count": comments_count,
         "views_count": views_count,
+        "repost_count": repost_count,
         "is_remix_repost": is_remix,
         "is_tagged_post": is_tagged,
         "tagged_users_count": tagged_count,
@@ -527,7 +695,7 @@ def scrape_post_detail(
         "keywords_csv": _extract_keywords(caption),
         "mentions_csv": ",".join(sorted(set(mentions))) if mentions else None,
         "caption_text": caption,
-        "location_name": _extract_location(page),
+        "location_name": location_name,
         "media_asset_urls": media_asset_urls,
         "missing_reason_post": missing_reason,
     }
