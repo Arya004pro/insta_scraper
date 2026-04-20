@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 
 PRIVATE_PATTERNS = [
@@ -261,6 +261,119 @@ def _extract_primary_external_url(page: object) -> str | None:
                 return href
         except Exception:
             continue
+
+    # Some profiles expose links through a popup trigger ("... and N more").
+    dialog_urls = _extract_external_urls_from_links_dialog(
+        page, "https://www.instagram.com/"
+    )
+    return dialog_urls[0] if dialog_urls else None
+
+
+def _normalize_external_candidate(raw: str | None, base_url: str) -> str | None:
+    if not raw:
+        return None
+    candidate = (raw or "").strip()
+    if not candidate:
+        return None
+
+    if candidate.startswith("www."):
+        candidate = f"https://{candidate}"
+
+    if not candidate.startswith(("http://", "https://", "/")) and re.match(
+        r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/.*)?$", candidate
+    ):
+        candidate = f"https://{candidate}"
+
+    absolute = urljoin(base_url, candidate)
+    try:
+        host = (urlparse(absolute).hostname or "").lower()
+    except Exception:
+        return None
+
+    if not host:
+        return None
+    if host in {"www.instagram.com", "instagram.com", "m.instagram.com"}:
+        return None
+    return absolute
+
+
+def _extract_external_urls_from_links_dialog(page: object, base_url: str) -> list[str]:
+    try:
+        clicked = bool(
+            page.evaluate(
+                r"""
+                () => {
+                  const nodes = Array.from(document.querySelectorAll("header button, header [role='button']"));
+                  for (const node of nodes) {
+                    const text = (node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    if (!text) continue;
+                    if ((text.includes(' and ') && text.includes('more')) || text.startsWith('www.') || text.includes('.com')) {
+                      node.click();
+                      return true;
+                    }
+                  }
+                  return false;
+                }
+                """
+            )
+        )
+    except Exception:
+        clicked = False
+
+    if not clicked:
+        return []
+
+    page.wait_for_timeout(600)
+
+    candidates: list[str] = []
+    try:
+        payload = page.evaluate(
+            r"""
+            () => {
+              const out = [];
+              const dialogs = Array.from(document.querySelectorAll("div[role='dialog']"));
+              const dialog = dialogs[dialogs.length - 1];
+              if (!dialog) return out;
+
+              for (const a of dialog.querySelectorAll('a[href]')) {
+                const href = (a.getAttribute('href') || '').trim();
+                if (href) out.push(href);
+              }
+
+              const text = (dialog.innerText || '').replace(/\u00a0/g, ' ');
+              const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
+              const urlLike = /((https?:\/\/)?(www\.)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}(\/[^\s]*)?)/g;
+              for (const line of lines) {
+                const matches = line.match(urlLike) || [];
+                for (const m of matches) out.push(m);
+              }
+
+              return Array.from(new Set(out));
+            }
+            """
+        )
+        if isinstance(payload, list):
+            candidates = [str(x) for x in payload if isinstance(x, str)]
+    except Exception:
+        candidates = []
+    finally:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        normalized = _normalize_external_candidate(raw, base_url)
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        urls.append(normalized)
+
+    return urls
     return None
 
 
@@ -276,14 +389,18 @@ def _extract_all_external_urls(page: object, base_url: str) -> list[str]:
             href = link.get_attribute("href")
         except Exception:
             href = None
-        if not href:
-            continue
-        absolute = urljoin(base_url, href)
-        if absolute.startswith("https://www.instagram.com/"):
+        absolute = _normalize_external_candidate(href, base_url)
+        if not absolute:
             continue
         if absolute not in seen:
             seen.add(absolute)
             urls.append(absolute)
+
+    for absolute in _extract_external_urls_from_links_dialog(page, base_url):
+        if absolute not in seen:
+            seen.add(absolute)
+            urls.append(absolute)
+
     return urls
 
 
@@ -380,6 +497,9 @@ def scrape_profile_header(page: object, profile_url: str) -> ProfileScrapeResult
         )
 
     external_urls = _extract_all_external_urls(page, profile_url)
+    if not profile_data["external_url_primary"] and external_urls:
+        profile_data["external_url_primary"] = external_urls[0]
+
     if (
         profile_data["external_url_primary"]
         and profile_data["external_url_primary"] not in external_urls

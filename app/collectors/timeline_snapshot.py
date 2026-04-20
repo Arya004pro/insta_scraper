@@ -141,10 +141,8 @@ def _extract_media_urls(node: dict[str, Any], media_type: str | None) -> list[st
 def _sample_bucket(media_type: str | None, urls: list[str]) -> str | None:
     if media_type == "reel":
         return "reels"
-    if media_type == "image_post":
+    if media_type in {"image_post", "video_post", "carousel_post"}:
         return "posts"
-    if media_type == "carousel_post" and len(urls) >= 2:
-        return "multi_image_posts"
     return None
 
 
@@ -247,5 +245,96 @@ def collect_recent_timeline_items(
             "media_asset_urls": media_urls,
         }
         results.append(result)
+
+    return results
+
+
+def collect_recent_reels_tab_items(
+    page: object,
+    profile_url: str,
+    wait_ms: int = 4500,
+) -> list[dict[str, Any]]:
+    reels_payload: dict[str, Any] | None = None
+
+    def _on_response(response: Any) -> None:
+        nonlocal reels_payload
+        if reels_payload is not None:
+            return
+
+        ctype = (response.headers.get("content-type") or "").lower()
+        if "application/json" not in ctype:
+            return
+        if "/graphql/query" not in response.url:
+            return
+
+        try:
+            obj = json.loads(response.text())
+        except Exception:
+            return
+
+        data = obj.get("data") if isinstance(obj, dict) else None
+        if not isinstance(data, dict):
+            return
+
+        payload = data.get("xdt_api__v1__clips__user__connection_v2")
+        if isinstance(payload, dict):
+            reels_payload = payload
+
+    page.on("response", _on_response)
+    page.goto(f"{profile_url.rstrip('/')}/reels/", wait_until="domcontentloaded")
+    if wait_ms > 0:
+        page.wait_for_timeout(wait_ms)
+
+    edges = (reels_payload or {}).get("edges") or []
+    results: list[dict[str, Any]] = []
+
+    for edge in edges:
+        node = edge.get("node") if isinstance(edge, dict) else None
+        if not isinstance(node, dict):
+            continue
+
+        media = node.get("media") if isinstance(node.get("media"), dict) else node
+        if not isinstance(media, dict):
+            continue
+
+        shortcode = media.get("code")
+        if not isinstance(shortcode, str) or not shortcode:
+            continue
+
+        play_or_view = media.get("play_count") or media.get("view_count")
+        try:
+            views_count = int(play_or_view) if play_or_view is not None else None
+        except Exception:
+            views_count = None
+
+        try:
+            likes_count = int(media.get("like_count"))
+        except Exception:
+            likes_count = None
+
+        try:
+            comments_count = int(media.get("comment_count"))
+        except Exception:
+            comments_count = None
+
+        image_url = None
+        image_versions = media.get("image_versions2")
+        if isinstance(image_versions, dict):
+            image_url = _best_image_url(image_versions)
+
+        results.append(
+            {
+                "shortcode": shortcode,
+                "post_url": f"https://www.instagram.com/reel/{shortcode}/",
+                "media_type": "reel",
+                "sample_bucket": "reels",
+                "posted_at_ist": _to_iso_ist_from_epoch(media.get("taken_at")),
+                "likes_count": likes_count,
+                "comments_count": comments_count,
+                "views_count": views_count,
+                "thumbnail_url": image_url,
+                "media_asset_urls": [image_url] if image_url else [],
+            }
+        )
 
     return results

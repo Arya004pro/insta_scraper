@@ -377,21 +377,22 @@
         ["Date Joined", profile.date_joined],
         ["Based In", profile.account_based_in],
         ["Verified Time", profile.time_verified],
-        ["Primary External URL", profile.external_url_primary],
+        ["Provided Primary Link", profile.external_url_primary],
         ["Active Ads", profile.active_ads_status],
         ["Active Ads URL", profile.active_ads_url],
       ];
       profileBox.innerHTML = `
         <table>${rows.map(([k,v]) => `<tr><th>${esc(k)}</th><td>${esc(v || "")}</td></tr>`).join("")}</table>
-        <div class="small" style="margin-top:8px;">All External Links:</div>
+        <div class="small" style="margin-top:8px;">Provided Links:</div>
         ${linkList(normalizedExternalLinks)}
       `;
     }
 
-    function renderSampleCard(title, item) {
+    function renderSampleCard(title, item, isReel) {
       if (!item) {
         return `<div class="sample"><strong>${esc(title)}</strong><div class="muted" style="margin-top:6px;">Not captured in this run.</div></div>`;
       }
+      const viewsRow = isReel ? `<tr><th>Views</th><td>${esc(item.views_count)}</td></tr>` : "";
       return `
         <div class="sample">
           <strong>${esc(title)}</strong>
@@ -400,7 +401,7 @@
             <tr><th>Media Type</th><td>${esc(item.media_type)}</td></tr>
             <tr><th>Likes</th><td>${esc(item.likes_count)}</td></tr>
             <tr><th>Comments</th><td>${esc(item.comments_count)}</td></tr>
-            <tr><th>Views</th><td>${esc(item.views_count)}</td></tr>
+            ${viewsRow}
             <tr><th>Hashtags</th><td>${esc(item.hashtags_csv || "")}</td></tr>
             <tr><th>Keywords</th><td>${esc(item.keywords_csv || "")}</td></tr>
             <tr><th>Mentions</th><td>${esc(item.mentions_csv || "")}</td></tr>
@@ -416,9 +417,8 @@
     function renderSamples(samples) {
       sampleBox.innerHTML = `
         <div class="sample-grid">
-          ${renderSampleCard("Single Image Post", samples.single_image_post)}
-          ${renderSampleCard("Multi Image Post", samples.multi_image_post)}
-          ${renderSampleCard("Reel", samples.reel)}
+          ${renderSampleCard("Post", samples.post, false)}
+          ${renderSampleCard("Reel", samples.reel, true)}
         </div>
       `;
     }
@@ -460,11 +460,14 @@
 
     function renderOutputCard(item, kindLabel) {
       const previewUrl = pickPreviewUrl(item);
+      const isReel = String(item.media_type || "").toLowerCase() === "reel" || kindLabel === "Reel";
       const pills = [
         `<span class='pill'>${esc(kindLabel)}</span>`,
         item.media_type ? `<span class='pill'>${esc(item.media_type)}</span>` : "",
         item.sample_bucket ? `<span class='pill'>${esc(item.sample_bucket)}</span>` : "",
       ].join("");
+
+      const viewsRow = isReel ? `<tr><th>Views</th><td>${esc(item.views_count || "")}</td></tr>` : "";
 
       return `
         <div class='output-card'>
@@ -474,7 +477,7 @@
           <table>
             <tr><th>Likes</th><td>${esc(item.likes_count || "")}</td></tr>
             <tr><th>Comments</th><td>${esc(item.comments_count || "")}</td></tr>
-            <tr><th>Views</th><td>${esc(item.views_count || "")}</td></tr>
+            ${viewsRow}
             <tr><th>Tagged Users</th><td>${esc(item.tagged_users_count || "")}</td></tr>
             <tr><th>Hashtags</th><td>${esc(item.hashtags_csv || "")}</td></tr>
             <tr><th>Keywords</th><td>${esc(item.keywords_csv || "")}</td></tr>

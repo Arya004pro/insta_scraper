@@ -37,7 +37,7 @@ def _to_int(raw: str | None) -> int | None:
 
 def _extract_media_links_via_dom(
     page: object,
-) -> list[tuple[str, str, str, str | None, int | None, int | None]]:
+) -> list[tuple[str, str, str, str | None, int | None, int | None, int | None]]:
     try:
         rows = page.evaluate(
             r"""
@@ -48,7 +48,11 @@ def _extract_media_links_via_dom(
                                 return m ? m[1] : null;
                             };
 
-                            const links = Array.from(document.querySelectorAll("article a[href]"));
+                            const links = Array.from(
+                                document.querySelectorAll(
+                                    "article a[href], main a[href*='/reel/'], section a[href*='/reel/']"
+                                )
+                            );
                             const out = [];
                             const seen = new Set();
 
@@ -92,11 +96,21 @@ def _extract_media_links_via_dom(
                                 const blob = `${a.getAttribute("aria-label") || ""} ${a.innerText || a.textContent || ""}`;
                                 let likesRaw = null;
                                 let commentsRaw = null;
+                                let viewsRaw = null;
 
                                 const mLikes = blob.match(/([0-9][0-9.,]*\s*[kmbKMB]?)\s+likes?/i);
                                 if (mLikes) likesRaw = mLikes[1];
                                 const mComments = blob.match(/([0-9][0-9.,]*\s*[kmbKMB]?)\s+comments?/i);
                                 if (mComments) commentsRaw = mComments[1];
+                                const mViews = blob.match(/([0-9][0-9.,]*\s*[kmbKMB]?)\s+(?:views?|plays?)/i);
+                                if (mViews) viewsRaw = mViews[1];
+
+                                if (!viewsRaw && pathKind === "reel") {
+                                    const tokens = blob.match(/[0-9][0-9.,]*\s*[kmbKMB]?/g) || [];
+                                    if (tokens.length > 0) {
+                                        viewsRaw = tokens[0];
+                                    }
+                                }
 
                                 if (!likesRaw) {
                                     const likesIcon = a.querySelector("svg[aria-label='Likes'], svg[aria-label='likes']");
@@ -111,7 +125,7 @@ def _extract_media_links_via_dom(
                                     }
                                 }
 
-                                out.push({ shortcode, href, mediaHint, thumbnailUrl: thumb, likesRaw, commentsRaw });
+                                out.push({ shortcode, href, mediaHint, thumbnailUrl: thumb, likesRaw, commentsRaw, viewsRaw });
                             }
 
                             return out;
@@ -121,7 +135,9 @@ def _extract_media_links_via_dom(
     except Exception:
         return []
 
-    found: list[tuple[str, str, str, str | None, int | None, int | None]] = []
+    found: list[
+        tuple[str, str, str, str | None, int | None, int | None, int | None]
+    ] = []
     for row in rows or []:
         href = row.get("href") if isinstance(row, dict) else None
         normalized = _normalize_media_href(href)
@@ -134,6 +150,7 @@ def _extract_media_links_via_dom(
         comments_count = (
             _to_int(row.get("commentsRaw")) if isinstance(row, dict) else None
         )
+        views_count = _to_int(row.get("viewsRaw")) if isinstance(row, dict) else None
         if media_hint in {"reel", "image_post", "carousel_post"}:
             media_kind = media_hint
         found.append(
@@ -144,6 +161,7 @@ def _extract_media_links_via_dom(
                 thumbnail_url,
                 likes_count,
                 comments_count,
+                views_count,
             )
         )
     return found
@@ -179,16 +197,18 @@ def extract_media_links_from_html(html: str) -> list[tuple[str, str, str]]:
 
 def _extract_media_links(
     page: object,
-) -> list[tuple[str, str, str, str | None, int | None, int | None]]:
+) -> list[tuple[str, str, str, str | None, int | None, int | None, int | None]]:
     dom_found = _extract_media_links_via_dom(page)
     if dom_found:
         return dom_found
 
-    found: list[tuple[str, str, str, str | None, int | None, int | None]] = []
+    found: list[
+        tuple[str, str, str, str | None, int | None, int | None, int | None]
+    ] = []
     try:
         html = page.locator("article").first.inner_html(timeout=3000)
         found = [
-            (s, u, k, None, None, None)
+            (s, u, k, None, None, None, None)
             for s, u, k in extract_media_links_from_html(html)
         ]
     except Exception:
@@ -214,20 +234,31 @@ def _extract_media_links(
         if shortcode in seen:
             continue
         seen.add(shortcode)
-        found.append((shortcode, post_url, media_kind, None, None, None))
+        found.append((shortcode, post_url, media_kind, None, None, None, None))
     return found
+
+
+def _matches_media_filter(media_kind: str | None, media_filter: str) -> bool:
+    if media_filter == "reels":
+        return media_kind == "reel"
+    if media_filter == "posts":
+        return media_kind != "reel"
+    return True
 
 
 def enumerate_grid_posts(
     page: object,
     settings: Settings,
     resume_state: dict | None = None,
+    media_filter: str = "all",
 ) -> list[dict]:
     ordered: OrderedDict[str, dict] = OrderedDict()
     resume_state = resume_state or {}
     for row in resume_state.get("discovered_posts", []):
         shortcode = row.get("shortcode")
-        if shortcode:
+        if shortcode and _matches_media_filter(
+            row.get("media_type_hint"), media_filter
+        ):
             ordered[shortcode] = row
 
     for (
@@ -237,7 +268,10 @@ def enumerate_grid_posts(
         thumbnail_url,
         likes_count,
         comments_count,
+        views_count,
     ) in _extract_media_links(page):
+        if not _matches_media_filter(media_kind, media_filter):
+            continue
         if shortcode not in ordered:
             ordered[shortcode] = {
                 "shortcode": shortcode,
@@ -246,6 +280,7 @@ def enumerate_grid_posts(
                 "thumbnail_url": thumbnail_url,
                 "likes_count": likes_count,
                 "comments_count": comments_count,
+                "views_count": views_count,
             }
         else:
             existing = ordered[shortcode]
@@ -260,6 +295,8 @@ def enumerate_grid_posts(
                 existing["likes_count"] = likes_count
             if existing.get("comments_count") is None and comments_count is not None:
                 existing["comments_count"] = comments_count
+            if existing.get("views_count") is None and views_count is not None:
+                existing["views_count"] = views_count
 
     if settings.scroll_idle_rounds <= 0:
         return list(ordered.values())
@@ -274,7 +311,10 @@ def enumerate_grid_posts(
             thumbnail_url,
             likes_count,
             comments_count,
+            views_count,
         ) in _extract_media_links(page):
+            if not _matches_media_filter(media_kind, media_filter):
+                continue
             if shortcode not in ordered:
                 ordered[shortcode] = {
                     "shortcode": shortcode,
@@ -283,6 +323,7 @@ def enumerate_grid_posts(
                     "thumbnail_url": thumbnail_url,
                     "likes_count": likes_count,
                     "comments_count": comments_count,
+                    "views_count": views_count,
                 }
             else:
                 existing = ordered[shortcode]
@@ -300,6 +341,8 @@ def enumerate_grid_posts(
                     and comments_count is not None
                 ):
                     existing["comments_count"] = comments_count
+                if existing.get("views_count") is None and views_count is not None:
+                    existing["views_count"] = views_count
 
         if len(ordered) == previous_count:
             idle_rounds += 1

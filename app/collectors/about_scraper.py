@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 
 def _is_about_details_text(text: str) -> bool:
@@ -256,7 +257,13 @@ def _extract_following_line(text: str, labels: list[str]) -> str | None:
 
 
 def _extract_ads_library_url(page: object) -> str | None:
-    selectors = ["a[href*='ads/library']", "a[href*='facebook.com/ads/library']"]
+    selectors = [
+        "a[href*='ads/library']",
+        "a[href*='facebook.com/ads/library']",
+        "a[href*='Ad Library']",
+        "a[href*='ad library']",
+        "a[href]",
+    ]
     dialogs = page.locator("div[role='dialog']")
     try:
         count = dialogs.count()
@@ -267,13 +274,33 @@ def _extract_ads_library_url(page: object) -> str | None:
         dialog = dialogs.nth(idx)
         for selector in selectors:
             try:
-                href = dialog.locator(selector).first.get_attribute(
-                    "href", timeout=1200
-                )
+                nodes = dialog.locator(selector)
+                node_count = nodes.count()
             except Exception:
-                href = None
-            if href:
-                return href
+                node_count = 0
+
+            for n in range(node_count):
+                try:
+                    href = nodes.nth(n).get_attribute("href", timeout=1200)
+                except Exception:
+                    href = None
+                if not href:
+                    continue
+
+                candidate = href.strip()
+                if "ads/library" in candidate.lower():
+                    return candidate
+
+                try:
+                    parsed = urlparse(candidate)
+                    query = parse_qs(parsed.query)
+                    wrapped = (query.get("u") or [None])[0]
+                    if wrapped:
+                        unwrapped = unquote(wrapped)
+                        if "ads/library" in unwrapped.lower():
+                            return unwrapped
+                except Exception:
+                    continue
     return None
 
 
@@ -313,6 +340,14 @@ def scrape_about_section(page: object) -> dict:
             active_ads_status = "yes"
     else:
         active_ads_status = None
+
+    if active_ads_status == "yes" and not active_ads_url:
+        username = page.url.rstrip("/").split("/")[-1]
+        if username:
+            active_ads_url = (
+                "https://www.facebook.com/ads/library/"
+                f"?active_status=all&ad_type=all&country=ALL&q={quote_plus(username)}"
+            )
 
     try:
         page.keyboard.press("Escape")

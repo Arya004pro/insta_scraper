@@ -88,9 +88,7 @@ def _pick_sample(
 
         media_type = (row.get("media_type") or "").strip().lower()
         if bucket == "posts":
-            return media_type in {"image_post", "video_post"}
-        if bucket == "multi_image_posts":
-            return media_type == "carousel_post"
+            return media_type in {"image_post", "video_post", "carousel_post"}
         if bucket == "reels":
             return media_type == "reel"
         return False
@@ -155,6 +153,9 @@ def _serialize_output_row(row: dict[str, str] | None) -> dict | None:
     if not _is_http_url(post_url):
         post_url = None
 
+    media_type = (row.get("media_type") or "").strip().lower()
+    views_count = row.get("views_count") if media_type == "reel" else None
+
     return {
         "shortcode": row.get("shortcode"),
         "post_url": post_url,
@@ -163,7 +164,7 @@ def _serialize_output_row(row: dict[str, str] | None) -> dict | None:
         "sample_bucket": row.get("sample_bucket"),
         "likes_count": row.get("likes_count"),
         "comments_count": row.get("comments_count"),
-        "views_count": row.get("views_count"),
+        "views_count": views_count,
         "is_remix_repost": row.get("is_remix_repost"),
         "is_tagged_post": row.get("is_tagged_post"),
         "tagged_users_count": row.get("tagged_users_count"),
@@ -232,11 +233,14 @@ def _profile_from_summary_row(summary_row: dict[str, str]) -> dict[str, str]:
     return {
         "username": summary_row.get("Username", ""),
         "full_name": summary_row.get("Full Name", ""),
+        "external_url_primary": summary_row.get("External URL (Primary)", ""),
         "followers_count": summary_row.get("Followers", ""),
         "following_count": summary_row.get("Following", ""),
         "total_posts_count": summary_row.get("Total Posts (Profile)", ""),
         "date_joined": summary_row.get("Date Joined", ""),
         "account_based_in": summary_row.get("Account Based In", ""),
+        "active_ads_status": summary_row.get("Active Ads", ""),
+        "active_ads_url": summary_row.get("Active Ads URL", ""),
         "time_verified": summary_row.get("Time Verified", ""),
     }
 
@@ -453,12 +457,7 @@ def get_run_report(run_id: str) -> dict:
     all_media_rows = posts_rows + reels_rows
 
     samples = {
-        "single_image_post": _serialize_sample_row(
-            _pick_sample(all_media_rows, "posts")
-        ),
-        "multi_image_post": _serialize_sample_row(
-            _pick_sample(all_media_rows, "multi_image_posts")
-        ),
+        "post": _serialize_sample_row(_pick_sample(all_media_rows, "posts")),
         "reel": _serialize_sample_row(
             _pick_sample(reels_rows, "reels") or _pick_sample(all_media_rows, "reels")
         ),
