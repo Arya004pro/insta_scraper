@@ -10,6 +10,12 @@ PRIVATE_PATTERNS = [
     re.compile(r"this profile is private", re.IGNORECASE),
 ]
 
+ERROR_PAGE_PATTERNS = [
+    re.compile(r"something went wrong", re.IGNORECASE),
+    re.compile(r"page could not be loaded", re.IGNORECASE),
+    re.compile(r"reload page", re.IGNORECASE),
+]
+
 
 def parse_metric_count(raw: str | None) -> int | None:
     if not raw:
@@ -35,14 +41,67 @@ def detect_private_profile_from_text(text: str) -> bool:
     return any(p.search(text) for p in PRIVATE_PATTERNS)
 
 
-def _extract_header_count(page: object, label_contains: str) -> int | None:
+def _is_instagram_error_page(page: object) -> bool:
+    title = ""
+    body = ""
     try:
-        el = page.locator(f"header li:has-text('{label_contains}')").first
-        txt = el.inner_text(timeout=2000)
-        match = re.search(r"([\d.,]+[kmb]?)", txt, re.IGNORECASE)
-        return parse_metric_count(match.group(1) if match else None)
+        title = str(page.title() or "")
     except Exception:
-        return None
+        title = ""
+    try:
+        body = str(page.inner_text("body", timeout=1500) or "")
+    except Exception:
+        body = ""
+
+    text = f"{title}\n{body}"
+    return any(p.search(text) for p in ERROR_PAGE_PATTERNS)
+
+
+def _extract_header_count(page: object, label_contains: str) -> int | None:
+    label = (label_contains or "").strip().lower()
+    selector_groups: dict[str, list[str]] = {
+        "followers": [
+            "header a[href$='/followers/']",
+            "a[href$='/followers/']",
+            "header li:has-text('followers')",
+            "header section ul li",
+            "header ul li",
+        ],
+        "following": [
+            "header a[href$='/following/']",
+            "a[href$='/following/']",
+            "header li:has-text('following')",
+            "header section ul li",
+            "header ul li",
+        ],
+        "posts": [
+            "header li:has-text('posts')",
+            "header section ul li",
+            "header ul li",
+        ],
+    }
+
+    selectors = selector_groups.get(label, ["header section ul li", "header ul li"])
+
+    for selector in selectors:
+        try:
+            nodes = page.locator(selector)
+            count = min(nodes.count(), 30)
+            for idx in range(count):
+                txt = (nodes.nth(idx).inner_text(timeout=1200) or "").strip()
+                if not txt:
+                    continue
+                if label not in txt.lower():
+                    continue
+
+                match = re.search(r"([\d.,]+\s*[kmb]?)", txt, re.IGNORECASE)
+                value = parse_metric_count(match.group(1) if match else None)
+                if value is not None:
+                    return value
+        except Exception:
+            continue
+
+    return None
 
 
 def _extract_og_description(page: object) -> str | None:
@@ -53,6 +112,64 @@ def _extract_og_description(page: object) -> str | None:
         return value or None
     except Exception:
         return None
+
+
+def _extract_exact_profile_counts_from_json(
+    page: object, username: str
+) -> dict[str, int | None]:
+    try:
+        html = page.content()
+    except Exception:
+        html = ""
+
+    if not html:
+        return {
+            "followers_count": None,
+            "following_count": None,
+            "total_posts_count": None,
+        }
+
+    scopes: list[str] = []
+    if username:
+        token = f'"username":"{username}"'
+        idx = html.find(token)
+        if idx >= 0:
+            start = max(0, idx - 40000)
+            end = min(len(html), idx + 120000)
+            scopes.append(html[start:end])
+    scopes.append(html)
+
+    def _first_int(patterns: list[str]) -> int | None:
+        for scope in scopes:
+            for pattern in patterns:
+                m = re.search(pattern, scope)
+                if not m:
+                    continue
+                value = parse_metric_count(m.group(1))
+                if value is not None:
+                    return value
+        return None
+
+    return {
+        "followers_count": _first_int(
+            [
+                r'"edge_followed_by"\s*:\s*\{[^{}]{0,300}?"count"\s*:\s*([0-9][0-9,\.]*)',
+                r'"follower_count"\s*:\s*([0-9][0-9,\.]*)',
+            ]
+        ),
+        "following_count": _first_int(
+            [
+                r'"edge_follow"\s*:\s*\{[^{}]{0,300}?"count"\s*:\s*([0-9][0-9,\.]*)',
+                r'"following_count"\s*:\s*([0-9][0-9,\.]*)',
+            ]
+        ),
+        "total_posts_count": _first_int(
+            [
+                r'"edge_owner_to_timeline_media"\s*:\s*\{[^{}]{0,300}?"count"\s*:\s*([0-9][0-9,\.]*)',
+                r'"media_count"\s*:\s*([0-9][0-9,\.]*)',
+            ]
+        ),
+    }
 
 
 def _parse_counts_from_og_description(text: str | None) -> dict[str, int | None]:
@@ -178,8 +295,20 @@ class ProfileScrapeResult:
 
 
 def scrape_profile_header(page: object, profile_url: str) -> ProfileScrapeResult:
-    page.goto(profile_url, wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
+    page_error_detected = False
+    for _ in range(2):
+        page.goto(profile_url, wait_until="domcontentloaded")
+        page.wait_for_timeout(1500)
+        if not _is_instagram_error_page(page):
+            page_error_detected = False
+            break
+
+        page_error_detected = True
+        try:
+            page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
+            page.wait_for_timeout(1200)
+        except Exception:
+            pass
 
     try:
         page.get_by_role("button", name=re.compile(r"not now", re.IGNORECASE)).click(
@@ -198,6 +327,7 @@ def scrape_profile_header(page: object, profile_url: str) -> ProfileScrapeResult
     username = profile_url.rstrip("/").split("/")[-1]
     og_description = _extract_og_description(page)
     og_counts = _parse_counts_from_og_description(og_description)
+    exact_counts = _extract_exact_profile_counts_from_json(page, username)
 
     followers_count = _extract_header_count(page, "followers")
     following_count = _extract_header_count(page, "following")
@@ -211,13 +341,19 @@ def scrape_profile_header(page: object, profile_url: str) -> ProfileScrapeResult
         "external_url_primary": _extract_primary_external_url(page),
         "followers_count": followers_count
         if followers_count is not None
+        else exact_counts["followers_count"]
+        if exact_counts["followers_count"] is not None
         else og_counts["followers_count"],
         "following_count": following_count
         if following_count is not None
+        else exact_counts["following_count"]
+        if exact_counts["following_count"] is not None
         else og_counts["following_count"],
         "highlight_reel_count": None,
         "total_posts_count": total_posts_count
         if total_posts_count is not None
+        else exact_counts["total_posts_count"]
+        if exact_counts["total_posts_count"] is not None
         else og_counts["total_posts_count"],
         "is_verified": False,
         "is_private": is_private,
@@ -252,6 +388,8 @@ def scrape_profile_header(page: object, profile_url: str) -> ProfileScrapeResult
 
     if not profile_data["full_name"] and not profile_data["biography"]:
         profile_data["missing_reason_profile"] = "parse_error"
+    if page_error_detected and not profile_data["full_name"]:
+        profile_data["missing_reason_profile"] = "instagram_page_error"
 
     return ProfileScrapeResult(
         profile_data=profile_data, external_urls=external_urls, is_private=is_private

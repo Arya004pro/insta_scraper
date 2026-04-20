@@ -66,12 +66,17 @@
       font-weight: 700;
       cursor: pointer;
     }
+    button.stop {
+      background: #ff6b6b;
+      color: #210707;
+    }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     .small { color: var(--muted); font-size: 13px; }
     .status { font-weight: 700; }
     .status.running { color: var(--warn); }
     .status.completed { color: var(--ok); }
     .status.failed, .status.needs_human { color: var(--bad); }
+    .status.cancelling, .status.cancelled { color: var(--bad); }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -155,6 +160,7 @@
         <div class="row">
           <input id="urlInput" type="text" value="https://www.instagram.com/indriyajewels/" placeholder="https://www.instagram.com/username/" />
           <button id="startBtn">Start Run</button>
+          <button id="stopBtn" class="stop" disabled>Stop Run</button>
         </div>
         <div class="small" style="margin-top:8px;">Starts a scrape run, tracks live status, and shows profile + sample post/reel output links.</div>
       </section>
@@ -192,6 +198,7 @@
 
   <script>
     const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
     const urlInput = document.getElementById("urlInput");
     const runIdEl = document.getElementById("runId");
     const runStatusEl = document.getElementById("runStatus");
@@ -204,6 +211,15 @@
 
     let pollTimer = null;
     let currentRunId = null;
+
+    function isTerminalStatus(status) {
+      return ["completed", "failed", "needs_human", "skipped_private", "cancelled"].includes(status);
+    }
+
+    function setRunActive(active) {
+      startBtn.disabled = !!active;
+      stopBtn.disabled = !active || !currentRunId;
+    }
 
     function setStatus(status) {
       runStatusEl.textContent = status || "-";
@@ -221,13 +237,29 @@
       return "<ul>" + items.map(x => `<li><a href="${esc(x)}" target="_blank" rel="noopener noreferrer">${esc(x)}</a></li>`).join("") + "</ul>";
     }
 
+    function formatCount(value) {
+      if (value === null || value === undefined || value === "") return "";
+      const n = Number(String(value).replace(/,/g, ""));
+      if (!Number.isFinite(n)) return String(value);
+      const compact = new Intl.NumberFormat("en", {
+        notation: "compact",
+        maximumFractionDigits: 1,
+      }).format(n);
+      const full = new Intl.NumberFormat("en").format(n);
+      return `${compact} (${full})`;
+    }
+
     async function startRun() {
+      if (!startBtn.disabled && currentRunId && !isTerminalStatus(runStatusEl.textContent)) {
+        return;
+      }
+
       const url = (urlInput.value || "").trim();
       if (!url) {
         alert("Enter a profile URL.");
         return;
       }
-      startBtn.disabled = true;
+      setRunActive(true);
       errorTextEl.textContent = "";
 
       try {
@@ -250,8 +282,32 @@
         startPolling();
       } catch (err) {
         errorTextEl.textContent = String(err.message || err);
+        setRunActive(false);
       } finally {
-        startBtn.disabled = false;
+        if (!currentRunId) {
+          setRunActive(false);
+        }
+      }
+    }
+
+    async function stopRun() {
+      if (!currentRunId) return;
+      stopBtn.disabled = true;
+
+      try {
+        const resp = await fetch(`/v1/runs/${currentRunId}/stop`, { method: "POST" });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || "Failed to stop run");
+
+        setStatus(data.status);
+        progressTextEl.textContent = `${data.progress_pct ?? 0}% - ${data.progress_message || "stop requested"}`;
+        if (isTerminalStatus(data.status)) {
+          clearInterval(pollTimer);
+          setRunActive(false);
+          await loadReport();
+        }
+      } catch (err) {
+        errorTextEl.textContent = String(err.message || err);
       }
     }
 
@@ -274,12 +330,16 @@
           errorTextEl.textContent = `${data.error_code || "error"}: ${data.error_message}`;
         }
 
-        if (["completed", "failed", "needs_human", "skipped_private"].includes(data.status)) {
+        if (isTerminalStatus(data.status)) {
           clearInterval(pollTimer);
+          setRunActive(false);
           await loadReport();
+        } else {
+          setRunActive(true);
         }
       } catch (err) {
         clearInterval(pollTimer);
+        setRunActive(false);
         errorTextEl.textContent = String(err.message || err);
       }
     }
@@ -307,9 +367,9 @@
       const rows = [
         ["Username", profile.username],
         ["Full Name", profile.full_name],
-        ["Followers", profile.followers_count],
-        ["Following", profile.following_count],
-        ["Posts", profile.total_posts_count],
+        ["Followers", formatCount(profile.followers_count)],
+        ["Following", formatCount(profile.following_count)],
+        ["Posts", formatCount(profile.total_posts_count)],
         ["Date Joined", profile.date_joined],
         ["Based In", profile.account_based_in],
         ["Verified Time", profile.time_verified],
@@ -454,6 +514,7 @@
     }
 
     startBtn.addEventListener("click", startRun);
+    stopBtn.addEventListener("click", stopRun);
   </script>
 </body>
 </html>

@@ -4,31 +4,27 @@
 
 ```bash
 pip install -e .[dev]
-playwright install chromium
+camoufox fetch
 uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Brave-only required configuration:
+Camoufox configuration:
 
 ```bash
-set BRAVE_EXECUTABLE_PATH=C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe
-set BRAVE_USER_DATA_DIR=C:\Users\<YOUR_USER>\AppData\Local\BraveSoftware\Brave-Browser\User Data
-set BRAVE_PROFILE_DIRECTORY=Default
+set CAMOUFOX_EXECUTABLE_PATH=C:\Users\<YOUR_USER>\AppData\Local\camoufox\camoufox\Cache\camoufox.exe
+set CAMOUFOX_USER_DATA_DIR=C:\Users\<YOUR_USER>\AppData\Local\camoufox\Profiles\<latest.default-profile>
+set CAMOUFOX_CLONE_PROFILE_WHEN_RUNNING=1
 ```
 
-On Windows/macOS/Linux, the app now auto-detects common Brave install paths and user-data folders when these env vars are not set.
+If CAMOUFOX_EXECUTABLE_PATH is not set, the app tries to auto-detect from the installed camoufox package.
 
-If Brave is currently open, the scraper can auto-clone your profile snapshot instead of failing:
+Output location (default):
 
 ```bash
-set BRAVE_CLONE_PROFILE_WHEN_RUNNING=1
+set OUTPUT_ROOT_DIR=D:\Insta-scraper-camoufox
 ```
 
-If you want strict behavior (fail when Brave is open):
-
-```bash
-set BRAVE_CLONE_PROFILE_WHEN_RUNNING=0
-```
+By default, CSV artifacts are written to D:\Insta-scraper-camoufox\exports and media files to D:\Insta-scraper-camoufox\media.
 
 Optional external rotating proxy pool (JSON string):
 
@@ -80,7 +76,7 @@ set CHALLENGE_AUTO_RETRY_ATTEMPTS=3
 set CHALLENGE_AUTO_RETRY_WAIT_SECONDS=8
 ```
 
-Optional headless mode for Brave:
+Optional headless mode:
 
 ```bash
 set BROWSER_HEADLESS=1

@@ -96,7 +96,7 @@ def _pick_sample(
         return False
 
     best_row: dict[str, str] | None = None
-    best_score: tuple[int, int, int] = (-1, -1, -1)
+    best_score: tuple[int, int, int, int] = (-1, -1, -1, -1)
 
     for row in posts_rows:
         post_url = row.get("post_url")
@@ -111,10 +111,25 @@ def _pick_sample(
             or bool(_split_csv_values(row.get("media_asset_urls_csv") or ""))
         )
         has_full_parse = int(not (row.get("missing_reason_post") or "").strip())
-        score = (has_exact_bucket, has_any_media, has_full_parse)
+        numeric_points = 0
+        for key in ("likes_count", "comments_count", "views_count"):
+            if (row.get(key) or "").strip():
+                numeric_points += 1
+
+        score = (has_any_media, has_full_parse, numeric_points, has_exact_bucket)
         if score > best_score:
             best_score = score
             best_row = row
+
+    if best_row is None:
+        return None
+
+    # Do not present an "empty" sample card when row has almost no usable payload.
+    has_media = best_score[0] > 0
+    has_full_parse = best_score[1] > 0
+    has_numeric = best_score[2] > 0
+    if not (has_media or has_full_parse or has_numeric):
+        return None
 
     return best_row
 
@@ -264,6 +279,34 @@ def resume_run(run_id: str, req: ResumeRunRequest) -> RunStatusResponse:
         challenge_encountered=resumed.challenge_encountered,
         error_code=resumed.error_code,
         error_message=resumed.error_message,
+    )
+
+
+@app.post("/v1/runs/{run_id}/stop", response_model=RunStatusResponse)
+def stop_run(run_id: str) -> RunStatusResponse:
+    run = store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    try:
+        stopped = orchestrator.request_stop(run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Could not stop run: {exc}"
+        ) from exc
+
+    return RunStatusResponse(
+        run_id=stopped.run_id,
+        status=stopped.status,
+        started_at_ist=stopped.started_at_ist,
+        ended_at_ist=stopped.ended_at_ist,
+        progress_message=stopped.progress_message,
+        progress_pct=stopped.progress_pct,
+        challenge_encountered=stopped.challenge_encountered,
+        error_code=stopped.error_code,
+        error_message=stopped.error_message,
     )
 
 

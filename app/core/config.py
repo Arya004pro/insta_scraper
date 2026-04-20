@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +33,7 @@ class ProxyConfig:
 class Settings:
     app_name: str
     app_env: str
+    browser_engine: str
     project_root: Path
     data_dir: Path
     runs_dir: Path
@@ -41,10 +41,9 @@ class Settings:
     exports_dir: Path
     media_dir: Path
     sqlite_path: Path
-    brave_executable_path: str | None
-    brave_user_data_dir: str | None
-    brave_profile_directory: str
-    brave_clone_profile_when_running: bool
+    camoufox_executable_path: str | None
+    camoufox_user_data_dir: str | None
+    camoufox_clone_profile_when_running: bool
     browser_headless: bool
     browser_viewport_width: int
     browser_viewport_height: int
@@ -85,41 +84,33 @@ def _parse_proxy_pool(raw: str) -> list[ProxyConfig]:
     return result
 
 
-def _auto_detect_brave_executable_path() -> str | None:
-    configured = os.getenv("BRAVE_EXECUTABLE_PATH", "").strip()
+def _auto_detect_camoufox_executable_path() -> str | None:
+    configured = os.getenv("CAMOUFOX_EXECUTABLE_PATH", "").strip()
     if configured:
         return configured
 
+    try:
+        from camoufox.pkgman import launch_path
+
+        detected = launch_path()
+        if detected:
+            path = Path(detected)
+            if path.exists():
+                return str(path)
+    except Exception:
+        pass
+
     candidates: list[Path] = []
     if os.name == "nt":
-        program_files = Path(os.getenv("ProgramFiles", ""))
-        program_files_x86 = Path(os.getenv("ProgramFiles(x86)", ""))
+        local_app_data = Path(os.getenv("LOCALAPPDATA", ""))
         candidates.extend(
             [
-                program_files
-                / "BraveSoftware"
-                / "Brave-Browser"
-                / "Application"
-                / "brave.exe",
-                program_files_x86
-                / "BraveSoftware"
-                / "Brave-Browser"
-                / "Application"
-                / "brave.exe",
+                local_app_data / "camoufox" / "camoufox" / "Cache" / "camoufox.exe",
+                local_app_data / "camoufox" / "camoufox.exe",
             ]
-        )
-    elif sys.platform == "darwin":
-        candidates.append(
-            Path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser")
         )
     else:
-        candidates.extend(
-            [
-                Path("/usr/bin/brave-browser"),
-                Path("/usr/bin/brave"),
-                Path("/snap/bin/brave"),
-            ]
-        )
+        candidates.extend([Path("/usr/bin/camoufox"), Path("/usr/local/bin/camoufox")])
 
     for candidate in candidates:
         if candidate.exists():
@@ -127,48 +118,52 @@ def _auto_detect_brave_executable_path() -> str | None:
     return None
 
 
-def _auto_detect_brave_user_data_dir() -> str | None:
-    configured = os.getenv("BRAVE_USER_DATA_DIR", "").strip()
+def _auto_detect_camoufox_user_data_dir(fallback_dir: Path) -> str:
+    configured = os.getenv("CAMOUFOX_USER_DATA_DIR", "").strip()
     if configured:
         return configured
 
-    home = Path.home()
     candidates: list[Path] = []
     if os.name == "nt":
-        candidates.append(
-            home / "AppData" / "Local" / "BraveSoftware" / "Brave-Browser" / "User Data"
-        )
-    elif sys.platform == "darwin":
-        candidates.append(
-            home / "Library" / "Application Support" / "BraveSoftware" / "Brave-Browser"
-        )
-    else:
+        local_app_data = Path(os.getenv("LOCALAPPDATA", ""))
+        profiles_root = local_app_data / "camoufox" / "Profiles"
+        if profiles_root.exists() and profiles_root.is_dir():
+            profile_dirs = [
+                p
+                for p in profiles_root.iterdir()
+                if p.is_dir() and ".default" in p.name
+            ]
+            if profile_dirs:
+                latest_profile = max(
+                    profile_dirs,
+                    key=lambda p: p.stat().st_mtime if p.exists() else 0,
+                )
+                return str(latest_profile)
+
         candidates.extend(
             [
-                home / ".config" / "BraveSoftware" / "Brave-Browser",
-                home
-                / "snap"
-                / "brave"
-                / "current"
-                / ".config"
-                / "BraveSoftware"
-                / "Brave-Browser",
+                local_app_data / "camoufox" / "camoufox" / "User Data",
+                local_app_data / "camoufox" / "User Data",
+                local_app_data / "camoufox" / "Profiles",
             ]
         )
 
     for candidate in candidates:
         if candidate.exists():
             return str(candidate)
-    return None
+
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+    return str(fallback_dir)
 
 
 def load_settings() -> Settings:
     root = Path(__file__).resolve().parents[2]
+    output_root = Path(os.getenv("OUTPUT_ROOT_DIR", r"D:\Insta-scraper-camoufox"))
     data_dir = root / "data"
     runs_dir = data_dir / "runs"
     browser_state_dir = data_dir / "browser_state"
-    exports_dir = root / "exports"
-    media_dir = Path(os.getenv("SCRAPED_MEDIA_DIR", str(root / "Output")))
+    exports_dir = Path(os.getenv("EXPORTS_DIR", str(output_root / "exports")))
+    media_dir = Path(os.getenv("SCRAPED_MEDIA_DIR", str(output_root / "media")))
     sqlite_path = data_dir / "state.sqlite3"
 
     for p in (data_dir, runs_dir, browser_state_dir, exports_dir, media_dir):
@@ -177,17 +172,29 @@ def load_settings() -> Settings:
     proxy_pool = _parse_proxy_pool(os.getenv("PROXY_POOL_JSON", "[]"))
     headless_raw = os.getenv("BROWSER_HEADLESS", "0").strip().lower()
     browser_headless = headless_raw in {"1", "true", "yes", "on"}
-    clone_raw = os.getenv("BRAVE_CLONE_PROFILE_WHEN_RUNNING", "1").strip().lower()
-    brave_clone_profile_when_running = clone_raw in {"1", "true", "yes", "on"}
+    browser_engine = "camoufox"
+
+    camoufox_clone_raw = (
+        os.getenv("CAMOUFOX_CLONE_PROFILE_WHEN_RUNNING", "1").strip().lower()
+    )
+    camoufox_clone_profile_when_running = camoufox_clone_raw in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     sample_mode_raw = os.getenv("SAMPLE_COLLECTION_MODE", "1").strip().lower()
     sample_collection_mode = sample_mode_raw in {"1", "true", "yes", "on"}
 
-    brave_executable_path = _auto_detect_brave_executable_path()
-    brave_user_data_dir = _auto_detect_brave_user_data_dir()
+    camoufox_executable_path = _auto_detect_camoufox_executable_path()
+    camoufox_user_data_dir = _auto_detect_camoufox_user_data_dir(
+        browser_state_dir / "camoufox_user_data"
+    )
 
     return Settings(
         app_name="insta-scraper",
         app_env=os.getenv("APP_ENV", "dev"),
+        browser_engine=browser_engine,
         project_root=root,
         data_dir=data_dir,
         runs_dir=runs_dir,
@@ -195,10 +202,9 @@ def load_settings() -> Settings:
         exports_dir=exports_dir,
         media_dir=media_dir,
         sqlite_path=sqlite_path,
-        brave_executable_path=brave_executable_path,
-        brave_user_data_dir=brave_user_data_dir,
-        brave_profile_directory=os.getenv("BRAVE_PROFILE_DIRECTORY", "Default"),
-        brave_clone_profile_when_running=brave_clone_profile_when_running,
+        camoufox_executable_path=camoufox_executable_path,
+        camoufox_user_data_dir=camoufox_user_data_dir,
+        camoufox_clone_profile_when_running=camoufox_clone_profile_when_running,
         browser_headless=browser_headless,
         browser_viewport_width=int(os.getenv("BROWSER_VIEWPORT_WIDTH", "1100")),
         browser_viewport_height=int(os.getenv("BROWSER_VIEWPORT_HEIGHT", "750")),

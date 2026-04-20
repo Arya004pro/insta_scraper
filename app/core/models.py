@@ -10,6 +10,8 @@ InputType = Literal["single_url", "csv_file"]
 RunStatusLiteral = Literal[
     "queued",
     "running",
+    "cancelling",
+    "cancelled",
     "completed",
     "failed",
     "skipped_private",

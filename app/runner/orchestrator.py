@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import mimetypes
 import os
 import random
@@ -54,6 +55,10 @@ class ChallengeRequired(Exception):
         self.state = state or {}
 
 
+class RunCancelled(Exception):
+    pass
+
+
 @dataclass
 class ProfileRunResult:
     profile_row: dict[str, Any]
@@ -70,6 +75,7 @@ class RunOrchestrator:
         self.store = store
         self._session_manager = SessionManager(settings.browser_state_dir)
         self._threads: dict[str, threading.Thread] = {}
+        self._stop_flags: dict[str, threading.Event] = {}
         self._thread_lock = threading.Lock()
 
     def submit_run(self, req: StartRunRequest) -> str:
@@ -115,7 +121,86 @@ class RunOrchestrator:
         )
         with self._thread_lock:
             self._threads[run_id] = thread
+            self._stop_flags[run_id] = threading.Event()
         thread.start()
+
+    def request_stop(self, run_id: str) -> RunContext:
+        run = self.store.get_run(run_id)
+        if run is None:
+            raise KeyError(f"Run not found: {run_id}")
+
+        with self._thread_lock:
+            thread = self._threads.get(run_id)
+            stop_flag = self._stop_flags.get(run_id)
+            if stop_flag is None:
+                stop_flag = threading.Event()
+                self._stop_flags[run_id] = stop_flag
+            stop_flag.set()
+
+        self.store.add_event(run_id, "Stop requested by operator.", level="warning")
+
+        if run.status in {
+            "completed",
+            "failed",
+            "skipped_private",
+            "needs_human",
+            "cancelled",
+        }:
+            return run
+
+        if thread is None or not thread.is_alive():
+            ended = now_ist()
+            started_at = run.started_at_ist
+            duration = (
+                (ended - datetime.fromisoformat(started_at)).total_seconds()
+                if started_at
+                else None
+            )
+            return self.store.update_run(
+                run_id,
+                status="cancelled",
+                ended_at_ist=iso_ist(ended),
+                duration_sec=duration,
+                error_code="cancelled",
+                error_message="Run cancelled by operator.",
+                progress_message="Run cancelled by operator",
+            )
+
+        return self.store.update_run(
+            run_id,
+            status="cancelling",
+            error_code="cancel_requested",
+            error_message="Run cancellation requested by operator.",
+            progress_message="Stop requested",
+        )
+
+    def _is_stop_requested(self, run_id: str) -> bool:
+        with self._thread_lock:
+            flag = self._stop_flags.get(run_id)
+            if flag and flag.is_set():
+                return True
+
+        run = self.store.get_run(run_id)
+        if run is None:
+            return False
+        return run.status in {"cancelling", "cancelled"}
+
+    def _raise_if_stop_requested(self, run_id: str) -> None:
+        if self._is_stop_requested(run_id):
+            raise RunCancelled("Run cancelled by operator")
+
+    def _sleep_interruptible(self, run_id: str, seconds: float) -> None:
+        remaining = max(0.0, float(seconds))
+        while remaining > 0:
+            self._raise_if_stop_requested(run_id)
+            step = min(0.25, remaining)
+            time.sleep(step)
+            remaining -= step
+
+    def _cleanup_run_tracking(self, run_id: str) -> None:
+        with self._thread_lock:
+            self._threads.pop(run_id, None)
+            self._stop_flags.pop(run_id, None)
 
     def _execute_run(self, run_id: str, req: StartRunRequest, is_resume: bool) -> None:
         started = now_ist()
@@ -123,6 +208,7 @@ class RunOrchestrator:
         self.store.set_progress(run_id, "Run started", 1.0)
 
         try:
+            self._raise_if_stop_requested(run_id)
             targets = self._resolve_targets(req.input_type, req.input_value)
             if not targets:
                 raise ValueError("No valid target URLs found")
@@ -139,6 +225,7 @@ class RunOrchestrator:
             start_index = int(current_state.get("target_index", 0)) if is_resume else 0
 
             for idx, target in enumerate(targets[start_index:], start=start_index):
+                self._raise_if_stop_requested(run_id)
                 self.store.update_run(run_id, state={"target_index": idx})
                 self.store.set_progress(
                     run_id,
@@ -162,6 +249,7 @@ class RunOrchestrator:
                 if profile_result.status == "skipped_private":
                     self.store.update_run(run_id, status="skipped_private")
 
+            self._raise_if_stop_requested(run_id)
             self.store.set_progress(run_id, "Exporting artifacts", 93)
             artifacts = self._export(
                 run_id=run_id,
@@ -202,6 +290,25 @@ class RunOrchestrator:
             )
             self.store.set_progress(run_id, "Run completed", 100.0)
 
+        except RunCancelled as exc:
+            ended = now_ist()
+            run = self.store.get_run(run_id)
+            started_at = run.started_at_ist if run else iso_ist(started)
+            duration = (
+                (ended - datetime.fromisoformat(started_at)).total_seconds()
+                if started_at
+                else None
+            )
+            self.store.update_run(
+                run_id,
+                status="cancelled",
+                ended_at_ist=iso_ist(ended),
+                duration_sec=duration,
+                error_code="cancelled",
+                error_message=str(exc),
+                progress_message="Run cancelled by operator",
+            )
+            self.store.add_event(run_id, "Run cancelled by operator.", level="warning")
         except ChallengeRequired as challenge:
             run = self.store.get_run(run_id)
             state = run.state if run else {}
@@ -218,7 +325,35 @@ class RunOrchestrator:
                 run_id, "Run paused for human challenge resolution", level="warning"
             )
         except Exception as exc:
-            self.store.fail_run(run_id, "run_error", str(exc))
+            run = self.store.get_run(run_id)
+            if self._is_stop_requested(run_id) or (
+                run is not None and run.status in {"cancelling", "cancelled"}
+            ):
+                ended = now_ist()
+                started_at = run.started_at_ist if run else iso_ist(started)
+                duration = (
+                    (ended - datetime.fromisoformat(started_at)).total_seconds()
+                    if started_at
+                    else None
+                )
+                self.store.update_run(
+                    run_id,
+                    status="cancelled",
+                    ended_at_ist=iso_ist(ended),
+                    duration_sec=duration,
+                    error_code="cancelled",
+                    error_message="Run cancelled by operator",
+                    progress_message="Run cancelled by operator",
+                )
+                self.store.add_event(
+                    run_id,
+                    f"Run stopped while in-flight ({type(exc).__name__}: {exc})",
+                    level="warning",
+                )
+            else:
+                self.store.fail_run(run_id, "run_error", str(exc))
+        finally:
+            self._cleanup_run_tracking(run_id)
 
     def _resolve_targets(self, input_type: str, input_value: str) -> list[str]:
         if input_type == "single_url":
@@ -251,19 +386,33 @@ class RunOrchestrator:
             raise ValueError("Only CSV batch input is supported in v1")
         return urls
 
-    def _is_brave_running(self) -> bool:
+    def _is_camoufox_running(self) -> bool:
+        executable_name = "camoufox.exe" if os.name == "nt" else "camoufox"
+        if self.settings.camoufox_executable_path:
+            executable_name = Path(self.settings.camoufox_executable_path).name
+
         try:
             if os.name == "nt":
                 result = subprocess.run(
-                    ["tasklist", "/FI", "IMAGENAME eq brave.exe"],
+                    ["tasklist", "/FI", f"IMAGENAME eq {executable_name}"],
                     capture_output=True,
                     text=True,
                     check=False,
                 )
-                return "brave.exe" in result.stdout.lower()
+                if executable_name.lower() in result.stdout.lower():
+                    return True
+
+                # Camoufox may run as firefox.exe depending on platform package.
+                fallback = subprocess.run(
+                    ["tasklist", "/FI", "IMAGENAME eq firefox.exe"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                return "firefox.exe" in fallback.stdout.lower()
 
             result = subprocess.run(
-                ["pgrep", "-f", "brave"],
+                ["pgrep", "-f", "camoufox|firefox"],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -272,62 +421,36 @@ class RunOrchestrator:
         except Exception:
             return False
 
-    def _terminate_brave(self) -> None:
-        try:
-            if os.name == "nt":
-                subprocess.run(
-                    ["taskkill", "/IM", "brave.exe", "/F"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-            else:
-                subprocess.run(
-                    ["pkill", "-f", "brave"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-        except Exception:
-            pass
-
-    def _clone_brave_profile_snapshot(
+    def _clone_camoufox_profile_snapshot(
         self, run_id: str, source_user_data_dir: Path
     ) -> Path:
         clone_root = (
             self.settings.browser_state_dir
-            / "brave_profile_clones"
+            / "camoufox_profile_clones"
             / f"{run_id[:8]}_{int(time.time())}"
         )
+        clone_dir = clone_root / "profile"
         clone_root.mkdir(parents=True, exist_ok=True)
 
-        profile_name = self.settings.brave_profile_directory
-        source_profile_dir = source_user_data_dir / profile_name
-        if not source_profile_dir.exists():
+        if not source_user_data_dir.exists():
             raise RuntimeError(
-                f"Brave profile directory '{profile_name}' not found under {source_user_data_dir}"
+                f"Camoufox user data directory not found: {source_user_data_dir}"
             )
 
-        local_state = source_user_data_dir / "Local State"
-        if local_state.exists():
-            shutil.copy2(local_state, clone_root / "Local State")
-
-        first_run = source_user_data_dir / "First Run"
-        if first_run.exists():
-            shutil.copy2(first_run, clone_root / "First Run")
-
         ignore_names = {
-            "Cache",
-            "Code Cache",
-            "GPUCache",
-            "ShaderCache",
-            "Service Worker",
-            "GrShaderCache",
-            "DawnCache",
-            "Blob Storage",
-            "SingletonLock",
-            "SingletonCookie",
-            "SingletonSocket",
+            "cache2",
+            "startupCache",
+            "shader-cache",
+            "jumpListCache",
+            "minidumps",
+            "crashes",
+            "OfflineCache",
+            "thumbnails",
+            "sessionstore-backups",
+            "sessionstore.jsonlz4",
+            "previous.jsonlz4",
+            "recovery.jsonlz4",
+            "recovery.baklz4",
         }
 
         def _ignore(_: str, names: list[str]) -> set[str]:
@@ -337,17 +460,72 @@ class RunOrchestrator:
             try:
                 return shutil.copy2(src, dst)
             except OSError:
-                # Locked files (cookies/session journals) can be skipped in live clones.
                 return dst
 
         shutil.copytree(
-            source_profile_dir,
-            clone_root / profile_name,
+            source_user_data_dir,
+            clone_dir,
             dirs_exist_ok=True,
             ignore=_ignore,
             copy_function=_safe_copy,
         )
-        return clone_root
+        return clone_dir
+
+    def _find_saved_storage_state_path(self, username_hint: str) -> Path | None:
+        candidates: list[Path] = []
+        if username_hint:
+            candidates.append(self._session_manager.storage_state_path(username_hint))
+        candidates.append(self._session_manager.storage_state_path("default"))
+
+        seen: set[Path] = set()
+        for path in candidates:
+            if path in seen:
+                continue
+            seen.add(path)
+            if path.exists() and path.is_file():
+                return path
+
+        pool = sorted(
+            self.settings.browser_state_dir.glob("*_storage_state.json"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )
+        return pool[0] if pool else None
+
+    def _apply_saved_storage_state(
+        self, run_id: str, context: Any, username_hint: str
+    ) -> None:
+        state_path = self._find_saved_storage_state_path(username_hint)
+        if not state_path:
+            self.store.add_event(
+                run_id,
+                "Saved session state file not found. Proceeding with profile cookies only.",
+                level="warning",
+            )
+            return
+
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8-sig"))
+            cookies = payload.get("cookies")
+            if not isinstance(cookies, list) or not cookies:
+                self.store.add_event(
+                    run_id,
+                    f"Saved session state at {state_path.name} has no cookies.",
+                    level="warning",
+                )
+                return
+
+            context.add_cookies(cookies)
+            self.store.add_event(
+                run_id,
+                f"Loaded {len(cookies)} cookies from {state_path.name}.",
+            )
+        except Exception as exc:
+            self.store.add_event(
+                run_id,
+                f"Could not apply saved session cookies ({state_path.name}): {exc}",
+                level="warning",
+            )
 
     def _launch_context(
         self,
@@ -358,74 +536,67 @@ class RunOrchestrator:
     ) -> tuple[Any, Any, Path | None]:
         from playwright.sync_api import sync_playwright
 
-        _ = use_saved_session
-        _ = username_hint
-
-        if not self.settings.brave_executable_path:
+        if not self.settings.camoufox_executable_path:
             raise RuntimeError(
-                "Brave-only mode requires BRAVE_EXECUTABLE_PATH to be configured"
-            )
-        if not self.settings.brave_user_data_dir:
-            raise RuntimeError(
-                "Brave-only mode requires BRAVE_USER_DATA_DIR to be configured"
+                "Camoufox mode requires CAMOUFOX_EXECUTABLE_PATH or an installed camoufox package."
             )
 
-        source_user_data_dir = Path(self.settings.brave_user_data_dir)
-        if not source_user_data_dir.exists():
-            raise RuntimeError(f"BRAVE_USER_DATA_DIR not found: {source_user_data_dir}")
+        source_user_data_dir = Path(self.settings.camoufox_user_data_dir or "")
+        source_user_data_dir.mkdir(parents=True, exist_ok=True)
 
         playwright = sync_playwright().start()
         proxy = proxy_manager.active
         temp_profile_dir: Path | None = None
         effective_user_data_dir = source_user_data_dir
 
-        if self._is_brave_running():
-            if not self.settings.brave_clone_profile_when_running:
+        if self._is_camoufox_running():
+            if not self.settings.camoufox_clone_profile_when_running:
                 raise RuntimeError(
-                    "Brave is currently running. Close Brave and retry, or enable BRAVE_CLONE_PROFILE_WHEN_RUNNING=1"
+                    "Camoufox appears to be running. Close it and retry, or enable CAMOUFOX_CLONE_PROFILE_WHEN_RUNNING=1"
                 )
             try:
                 self.store.add_event(
                     run_id,
-                    "Brave appears to be open. Cloning profile snapshot for scraping session.",
+                    "Camoufox appears to be open. Cloning profile snapshot for scraping session.",
                 )
-                temp_profile_dir = self._clone_brave_profile_snapshot(
+                temp_profile_dir = self._clone_camoufox_profile_snapshot(
                     run_id, source_user_data_dir
                 )
                 effective_user_data_dir = temp_profile_dir
-            except Exception:
-                self.store.add_event(
-                    run_id,
-                    "Profile clone failed while Brave is open. Closing Brave and retrying with original profile.",
-                    level="warning",
-                )
-                self._terminate_brave()
-                time.sleep(2)
-                if self._is_brave_running():
-                    raise RuntimeError(
-                        "Brave is still running after termination attempt. Close Brave manually and retry."
-                    )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Camoufox appears to be open and profile cloning failed. Close Camoufox or point CAMOUFOX_USER_DATA_DIR to a dedicated scraper profile."
+                ) from exc
 
-        launch_kwargs: dict[str, Any] = {"headless": self.settings.browser_headless}
-        launch_kwargs["executable_path"] = self.settings.brave_executable_path
-        launch_kwargs["channel"] = None
-        launch_kwargs["args"] = [
-            f"--profile-directory={self.settings.brave_profile_directory}",
-            f"--window-size={self.settings.browser_viewport_width},{self.settings.browser_viewport_height}",
-        ]
-        launch_kwargs["viewport"] = {
-            "width": self.settings.browser_viewport_width,
-            "height": self.settings.browser_viewport_height,
+        launch_kwargs: dict[str, Any] = {
+            "headless": self.settings.browser_headless,
+            "executable_path": self.settings.camoufox_executable_path,
+            "viewport": {
+                "width": self.settings.browser_viewport_width,
+                "height": self.settings.browser_viewport_height,
+            },
+            "firefox_user_prefs": {
+                "browser.startup.page": 0,
+                "browser.startup.homepage": "about:blank",
+                "browser.startup.homepage_override.mstone": "ignore",
+                "startup.homepage_welcome_url": "about:blank",
+                "startup.homepage_welcome_url.additional": "",
+                "browser.sessionstore.resume_from_crash": False,
+                "browser.sessionstore.restore_on_demand": False,
+                "browser.sessionstore.max_resumed_crashes": 0,
+            },
         }
         if proxy:
             launch_kwargs["proxy"] = proxy.as_playwright_proxy()
 
         try:
-            context = playwright.chromium.launch_persistent_context(
+            context = playwright.firefox.launch_persistent_context(
                 str(effective_user_data_dir),
                 **launch_kwargs,
             )
             context.set_default_timeout(15_000)
+            if use_saved_session:
+                self._apply_saved_storage_state(run_id, context, username_hint)
             return playwright, context, temp_profile_dir
         except Exception as exc:
             try:
@@ -435,7 +606,7 @@ class RunOrchestrator:
             if temp_profile_dir:
                 shutil.rmtree(temp_profile_dir, ignore_errors=True)
             raise RuntimeError(
-                "Could not launch Brave session. Ensure BRAVE_EXECUTABLE_PATH and BRAVE_USER_DATA_DIR are valid."
+                "Could not launch Camoufox session. Ensure camoufox is installed and CAMOUFOX_USER_DATA_DIR is valid."
             ) from exc
 
     def _is_closed_context_error(self, exc: Exception) -> bool:
@@ -689,7 +860,35 @@ class RunOrchestrator:
             use_saved_session=use_saved_session,
             username_hint=username_hint,
         )
-        page = context.new_page()
+
+        def _use_single_context_page(ctx: Any) -> Any:
+            try:
+                pages = [p for p in (ctx.pages or []) if not p.is_closed()]
+            except Exception:
+                pages = []
+
+            if pages:
+                page = pages[0]
+                for extra in pages[1:]:
+                    try:
+                        extra.close()
+                    except Exception:
+                        pass
+            else:
+                page = ctx.new_page()
+
+            try:
+                page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            return page
+
+        page = _use_single_context_page(context)
+
+        def _check_cancel() -> None:
+            self._raise_if_stop_requested(run_id)
+
+        _check_cancel()
         if proxy:
             self.store.update_run(run_id, proxy_id=proxy.proxy_id)
         self.store.add_event(run_id, f"Browser started for {profile_url}")
@@ -736,6 +935,7 @@ class RunOrchestrator:
             state: dict[str, Any],
             recovery_url: str | None = None,
         ) -> bool:
+            _check_cancel()
             hit, pattern = detect_challenge(page)
             if not hit:
                 return True
@@ -762,6 +962,7 @@ class RunOrchestrator:
 
             attempts = max(0, self.settings.challenge_auto_retry_attempts)
             for attempt in range(1, attempts + 1):
+                _check_cancel()
                 self.store.add_event(
                     run_id,
                     f"Challenge detected ({pattern}). Auto-recovery attempt {attempt}/{attempts}",
@@ -769,7 +970,7 @@ class RunOrchestrator:
                 )
                 wait_seconds = self.settings.challenge_auto_retry_wait_seconds
                 if wait_seconds > 0:
-                    time.sleep(wait_seconds)
+                    self._sleep_interruptible(run_id, wait_seconds)
 
                 try:
                     _relaunch_browser_session(
@@ -805,6 +1006,7 @@ class RunOrchestrator:
 
         def _relaunch_browser_session(reason: str) -> None:
             nonlocal playwright, context, page, temp_profile_dir
+            _check_cancel()
             self.store.add_event(run_id, reason)
 
             try:
@@ -825,7 +1027,7 @@ class RunOrchestrator:
                 use_saved_session=use_saved_session,
                 username_hint=username_hint,
             )
-            page = context.new_page()
+            page = _use_single_context_page(context)
             active_proxy = proxy_manager.active
             if active_proxy:
                 self.store.update_run(run_id, proxy_id=active_proxy.proxy_id)
@@ -935,14 +1137,19 @@ class RunOrchestrator:
                         f"Timeline snapshot unavailable ({type(exc).__name__}). Using visible grid fallback.",
                         level="warning",
                     )
-                    self.store.add_event(
-                        run_id,
-                        "Relaunching browser session before sample-mode fallback scan.",
-                        level="warning",
-                    )
-                    _relaunch_browser_session(
-                        "Relaunching browser session after timeline snapshot failure"
-                    )
+
+                    # Avoid heavy relaunch loops when Camoufox is already running.
+                    if self._is_closed_context_error(exc):
+                        self.store.add_event(
+                            run_id,
+                            "Timeline snapshot closed the current page; re-opening a working page in same context.",
+                            level="warning",
+                        )
+                        try:
+                            page = _use_single_context_page(context)
+                        except Exception:
+                            pass
+
                     try:
                         page.goto(profile_url, wait_until="domcontentloaded")
                         page.wait_for_timeout(
@@ -1153,6 +1360,7 @@ class RunOrchestrator:
                 )
 
             for i, post in enumerate(discovered):
+                _check_cancel()
                 shortcode = post.get("shortcode")
                 if not shortcode or shortcode in processed:
                     continue
@@ -1206,6 +1414,7 @@ class RunOrchestrator:
                 attempts = 0
                 last_error: Exception | None = None
                 while attempts < self.settings.retry_max_attempts:
+                    _check_cancel()
                     attempts += 1
                     try:
                         if self.settings.sample_collection_mode:
@@ -1217,6 +1426,63 @@ class RunOrchestrator:
                             media_type_hint=post.get("media_type_hint"),
                             page_settle_ms=self.settings.post_detail_wait_ms,
                         )
+
+                        # Fill sparse detail fields from nearby sources before persisting.
+                        if detail.get("likes_count") is None:
+                            post_likes = post.get("likes_count")
+                            if isinstance(post_likes, int):
+                                detail["likes_count"] = post_likes
+                        if detail.get("comments_count") is None:
+                            post_comments = post.get("comments_count")
+                            if isinstance(post_comments, int):
+                                detail["comments_count"] = post_comments
+                        if detail.get("views_count") is None:
+                            timeline_views = timeline_fallback.get("views_count")
+                            if isinstance(timeline_views, int):
+                                detail["views_count"] = timeline_views
+
+                        timeline_media = [
+                            x
+                            for x in (timeline_fallback.get("media_asset_urls") or [])
+                            if isinstance(x, str) and x
+                        ]
+                        if (
+                            not (detail.get("media_asset_urls") or [])
+                            and timeline_media
+                        ):
+                            detail["media_asset_urls"] = timeline_media
+                        if not (detail.get("media_asset_urls") or []):
+                            thumb = post.get("thumbnail_url")
+                            if isinstance(thumb, str) and thumb.startswith(
+                                ("http://", "https://")
+                            ):
+                                detail["media_asset_urls"] = [thumb]
+
+                        cached_row = recent_post_cache.get(str(shortcode))
+                        if cached_row:
+                            cached_media_type = (
+                                cached_row.get("media_type") or ""
+                            ).strip()
+                            if not detail.get("media_type") and cached_media_type:
+                                detail["media_type"] = cached_media_type
+
+                            cached_posted = (
+                                cached_row.get("posted_at_ist") or ""
+                            ).strip()
+                            if not detail.get("posted_at_ist") and cached_posted:
+                                detail["posted_at_ist"] = cached_posted
+
+                            for key in (
+                                "hashtags_csv",
+                                "keywords_csv",
+                                "mentions_csv",
+                                "caption_text",
+                                "location_name",
+                            ):
+                                if not detail.get(key):
+                                    raw = (cached_row.get(key) or "").strip()
+                                    if raw:
+                                        detail[key] = raw
                         post_challenge_cleared = _check_challenge_with_recovery(
                             {
                                 "stage": "post_detail",
@@ -1236,10 +1502,6 @@ class RunOrchestrator:
                         sample_bucket = self._sample_bucket_for_media_type(
                             detail.get("media_type")
                         )
-                        if detail.get("views_count") is None:
-                            timeline_views = timeline_fallback.get("views_count")
-                            if isinstance(timeline_views, int):
-                                detail["views_count"] = timeline_views
 
                         media_asset_local_paths: list[str] = []
                         if (
@@ -1341,7 +1603,7 @@ class RunOrchestrator:
                                     stage=f"post_detail_{i + 1}",
                                     reason=f"rate_limit_sample_mode:{type(exc).__name__}:{exc}",
                                 )
-                                time.sleep(cooldown)
+                                self._sleep_interruptible(run_id, cooldown)
 
                                 _relaunch_browser_session(
                                     f"Relaunching browser session after sample-mode rate limit on post {i + 1}"
@@ -1384,7 +1646,7 @@ class RunOrchestrator:
                                     level="warning",
                                 )
 
-                            time.sleep(cooldown)
+                            self._sleep_interruptible(run_id, cooldown)
                             _relaunch_browser_session(
                                 f"Relaunching browser session after rate-limit cooldown on post {i + 1}"
                             )
@@ -1408,11 +1670,28 @@ class RunOrchestrator:
                                 reason=f"exception:{type(exc).__name__}:{exc}",
                             )
                         if self._is_closed_context_error(exc):
-                            _relaunch_browser_session(
-                                f"Browser context closed while scraping post {i + 1}; retrying in fresh session"
-                            )
+                            recovered_in_place = False
+                            try:
+                                page = _use_single_context_page(context)
+                                page.goto(profile_url, wait_until="domcontentloaded")
+                                page.wait_for_timeout(
+                                    max(300, self.settings.post_detail_wait_ms)
+                                )
+                                recovered_in_place = True
+                                self.store.add_event(
+                                    run_id,
+                                    f"Recovered closed page in current session before retrying post {i + 1}.",
+                                    level="warning",
+                                )
+                            except Exception:
+                                recovered_in_place = False
+
+                            if not recovered_in_place:
+                                _relaunch_browser_session(
+                                    f"Browser context closed while scraping post {i + 1}; retrying in fresh session"
+                                )
                         wait_seconds = self.settings.retry_base_delay_seconds * attempts
-                        time.sleep(wait_seconds)
+                        self._sleep_interruptible(run_id, wait_seconds)
                         rotated_proxy = proxy_manager.rotate_now()
                         if rotated_proxy:
                             _relaunch_browser_session(
@@ -1553,6 +1832,7 @@ class RunOrchestrator:
             ):
                 backfilled = 0
                 for bucket in ("posts", "multi_image_posts", "reels"):
+                    _check_cancel()
                     if sample_captured[bucket]:
                         continue
                     candidate = next(
@@ -1625,6 +1905,7 @@ class RunOrchestrator:
             ):
                 backfilled_grid = 0
                 for bucket in ("posts", "multi_image_posts", "reels"):
+                    _check_cancel()
                     if sample_captured[bucket]:
                         continue
                     candidate = next(

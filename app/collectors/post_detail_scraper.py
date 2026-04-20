@@ -12,6 +12,31 @@ HASHTAG_RE = re.compile(r"#([A-Za-z0-9_]+)")
 MENTION_RE = re.compile(r"@([A-Za-z0-9._]+)")
 
 
+def _is_transient_error_or_blank(page: object) -> bool:
+    title = ""
+    body = ""
+    try:
+        title = str(page.title() or "")
+    except Exception:
+        title = ""
+    try:
+        body = str(page.inner_text("body", timeout=1200) or "")
+    except Exception:
+        body = ""
+
+    body_clean = body.strip()
+    if len(body_clean) < 20:
+        return True
+
+    text = f"{title}\n{body_clean}".lower()
+    return (
+        "something went wrong" in text
+        or "page could not be loaded" in text
+        or "reload page" in text
+        or "please wait" in text
+    )
+
+
 def _best_src_from_srcset(srcset: str | None) -> str | None:
     if not srcset:
         return None
@@ -410,9 +435,19 @@ def scrape_post_detail(
     media_type_hint: str | None = None,
     page_settle_ms: int = 700,
 ) -> dict:
-    page.goto(post_url, wait_until="domcontentloaded")
-    if page_settle_ms > 0:
-        page.wait_for_timeout(page_settle_ms)
+    for _ in range(2):
+        page.goto(post_url, wait_until="domcontentloaded")
+        if page_settle_ms > 0:
+            page.wait_for_timeout(page_settle_ms)
+
+        if not _is_transient_error_or_blank(page):
+            break
+
+        try:
+            page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
+            page.wait_for_timeout(max(600, page_settle_ms))
+        except Exception:
+            pass
 
     shortcode = post_url.rstrip("/").split("/")[-1]
 
