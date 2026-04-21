@@ -57,6 +57,25 @@
       padding: 10px 12px;
       font-size: 14px;
     }
+    input[type="number"] {
+      width: 140px;
+      background: #0f1d28;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 14px;
+    }
+    .checkbox-row {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .panel {
+      margin-top: 8px;
+    }
     button {
       background: var(--accent);
       color: #001b16;
@@ -65,6 +84,27 @@
       padding: 10px 14px;
       font-weight: 700;
       cursor: pointer;
+    }
+    .tab-row {
+      display: flex;
+      gap: 8px;
+      margin: 8px 0 10px;
+      flex-wrap: wrap;
+    }
+    .tab-btn {
+      background: #102434;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .tab-btn.active {
+      background: var(--accent);
+      color: #001b16;
+      border-color: transparent;
     }
     button.stop {
       background: #ff6b6b;
@@ -149,6 +189,17 @@
     }
     .muted { color: var(--muted); }
     ul { margin: 6px 0 0 16px; padding: 0; }
+    .table-scroll {
+      width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .data-table th,
+    .data-table td {
+      white-space: nowrap;
+      font-size: 12px;
+    }
   </style>
 </head>
 <body>
@@ -157,12 +208,28 @@
 
     <div class="grid">
       <section class="card">
-        <div class="row">
-          <input id="urlInput" type="text" value="https://www.instagram.com/indriyajewels/" placeholder="https://www.instagram.com/username/" />
-          <button id="startBtn">Start Run</button>
-          <button id="stopBtn" class="stop" disabled>Stop Run</button>
+        <div class="tab-row">
+          <button id="runStartTabBtn" type="button" class="tab-btn active">Run</button>
+          <button id="settingsStartTabBtn" type="button" class="tab-btn">Scan Settings</button>
         </div>
-        <div class="small" style="margin-top:8px;">Starts a scrape run, tracks live status, and shows profile + sample post/reel output links.</div>
+        <div id="runStartPanel" class="panel">
+          <div class="row">
+            <input id="urlInput" type="text" value="https://www.instagram.com/indriyajewels/" placeholder="https://www.instagram.com/username/" />
+            <button id="startBtn">Start Run</button>
+            <button id="stopBtn" class="stop" disabled>Stop Run</button>
+          </div>
+          <div class="small" style="margin-top:8px;">Starts a scrape run, tracks live status, and shows profile + sample post/reel output links.</div>
+        </div>
+        <div id="settingsStartPanel" class="panel" style="display:none;">
+          <div class="row">
+            <label class="small" for="entityCountInput">Entities To Scan</label>
+            <input id="entityCountInput" type="number" min="1" max="5000" step="1" value="50" />
+            <label class="checkbox-row"><input id="fastModeInput" type="checkbox" checked /> Fast Scan Mode</label>
+            <label class="checkbox-row"><input id="reelsOnlyInput" type="checkbox" checked /> Reels Only</label>
+            <label class="checkbox-row"><input id="statsOnlyInput" type="checkbox" checked /> Stats Only (No Media Download)</label>
+          </div>
+          <div class="small" style="margin-top:8px;">Fast scan mode prioritizes speed by using grid/timeline metrics and avoiding deep post-by-post navigation. Reels Only keeps this run focused on reel entities. Stats Only skips media-file download and captures statistical output only.</div>
+        </div>
       </section>
 
       <section class="card">
@@ -186,6 +253,10 @@
 
       <section class="card">
         <h3 style="margin:0 0 8px;">All Captured Outputs</h3>
+        <div class="tab-row">
+          <button id="mixedTabBtn" type="button" class="tab-btn active">Mixed Table (50)</button>
+          <button id="cardsTabBtn" type="button" class="tab-btn">Cards</button>
+        </div>
         <div id="outputBox" class="small">No output rows yet.</div>
       </section>
 
@@ -199,7 +270,15 @@
   <script>
     const startBtn = document.getElementById("startBtn");
     const stopBtn = document.getElementById("stopBtn");
+    const runStartTabBtn = document.getElementById("runStartTabBtn");
+    const settingsStartTabBtn = document.getElementById("settingsStartTabBtn");
+    const runStartPanel = document.getElementById("runStartPanel");
+    const settingsStartPanel = document.getElementById("settingsStartPanel");
     const urlInput = document.getElementById("urlInput");
+    const entityCountInput = document.getElementById("entityCountInput");
+    const fastModeInput = document.getElementById("fastModeInput");
+    const reelsOnlyInput = document.getElementById("reelsOnlyInput");
+    const statsOnlyInput = document.getElementById("statsOnlyInput");
     const runIdEl = document.getElementById("runId");
     const runStatusEl = document.getElementById("runStatus");
     const progressTextEl = document.getElementById("progressText");
@@ -207,10 +286,14 @@
     const profileBox = document.getElementById("profileBox");
     const sampleBox = document.getElementById("sampleBox");
     const outputBox = document.getElementById("outputBox");
+    const mixedTabBtn = document.getElementById("mixedTabBtn");
+    const cardsTabBtn = document.getElementById("cardsTabBtn");
     const artifactBox = document.getElementById("artifactBox");
 
     let pollTimer = null;
     let currentRunId = null;
+    let outputTab = "mixed";
+    let lastOutputsPayload = null;
 
     function isTerminalStatus(status) {
       return ["completed", "failed", "needs_human", "skipped_private", "cancelled"].includes(status);
@@ -253,6 +336,15 @@
       }
 
       const url = (urlInput.value || "").trim();
+      const entityRaw = String(entityCountInput?.value || "").trim();
+      const parsedEntity = Number(entityRaw);
+      const maxEntities =
+        Number.isFinite(parsedEntity) && parsedEntity > 0
+          ? Math.floor(parsedEntity)
+          : null;
+      const fastMode = !!(fastModeInput && fastModeInput.checked);
+      const reelsOnly = !!(reelsOnlyInput && reelsOnlyInput.checked);
+      const statsOnly = !!(statsOnlyInput && statsOnlyInput.checked);
       if (!url) {
         alert("Enter a profile URL.");
         return;
@@ -267,7 +359,11 @@
           body: JSON.stringify({
             input_type: "single_url",
             input_value: url,
-            use_saved_session: true
+            use_saved_session: true,
+            max_entities: maxEntities,
+            fast_mode: fastMode,
+            reels_only: reelsOnly,
+            stats_only: statsOnly
           })
         });
         const data = await resp.json();
@@ -494,19 +590,53 @@
       `;
     }
 
-    function renderOutputs(outputs) {
-      const posts = outputs.posts || [];
-      const reels = outputs.reels || [];
-      const total = Number(outputs.total_count || posts.length + reels.length);
+    function renderMixedTable(mixedRows, posts, reels, total) {
+      const limited = mixedRows.slice(0, 50);
+      const body = limited.map((item, idx) => {
+        const type = item.content_type || (String(item.media_type || "").toLowerCase() === "reel" ? "reel" : "post");
+        return `
+          <tr>
+            <td>${idx + 1}</td>
+            <td>${esc(type)}</td>
+            <td>${esc(item.media_type || "")}</td>
+            <td>${esc(item.shortcode || "")}</td>
+            <td>${item.post_url ? `<a href='${esc(item.post_url)}' target='_blank' rel='noopener noreferrer'>open</a>` : ""}</td>
+            <td>${esc(item.likes_count || "")}</td>
+            <td>${esc(item.comments_count || "")}</td>
+            <td>${esc(item.views_count || "")}</td>
+            <td>${esc(item.repost_count || "")}</td>
+            <td>${esc(item.posted_at_ist || "")}</td>
+          </tr>
+        `;
+      }).join("");
 
-      if (!total) {
-        outputBox.innerHTML = "<span class='muted'>No output rows yet.</span>";
-        return;
-      }
+      outputBox.innerHTML = `
+        <div class='small'>Total outputs: ${esc(total)} | Posts: ${esc(posts.length)} | Reels: ${esc(reels.length)} | Showing: ${esc(limited.length)} rows (max 50)</div>
+        <div class='table-scroll' style='margin-top:8px;'>
+          <table class='data-table'>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Type</th>
+                <th>Media Type</th>
+                <th>Shortcode</th>
+                <th>URL</th>
+                <th>Likes</th>
+                <th>Comments</th>
+                <th>Views</th>
+                <th>Reposts</th>
+                <th>Posted At (IST)</th>
+              </tr>
+            </thead>
+            <tbody>${body || "<tr><td colspan='10' class='muted'>No rows.</td></tr>"}</tbody>
+          </table>
+        </div>
+      `;
+    }
 
+    function renderOutputCards(posts, reels, total) {
       const postsCards = posts.map(item => renderOutputCard(item, "Post")).join("");
       const reelsCards = reels.map(item => renderOutputCard(item, "Reel")).join("");
-
       outputBox.innerHTML = `
         <div class='small'>Total outputs: ${esc(total)} | Posts: ${esc(posts.length)} | Reels: ${esc(reels.length)}</div>
         <h4 style='margin:10px 0 6px;'>Posts</h4>
@@ -514,6 +644,42 @@
         <h4 style='margin:12px 0 6px;'>Reels</h4>
         <div class='output-grid'>${reelsCards || "<span class='muted'>No reels rows.</span>"}</div>
       `;
+    }
+
+    function renderOutputs(outputs) {
+      lastOutputsPayload = outputs || {};
+      const mixed = lastOutputsPayload.mixed || [];
+      const posts = lastOutputsPayload.posts || [];
+      const reels = lastOutputsPayload.reels || [];
+      const total = Number(lastOutputsPayload.total_count || mixed.length || posts.length + reels.length);
+
+      if (!total) {
+        outputBox.innerHTML = "<span class='muted'>No output rows yet.</span>";
+        return;
+      }
+
+      if (outputTab === "cards") {
+        renderOutputCards(posts, reels, total);
+      } else {
+        renderMixedTable(mixed, posts, reels, total);
+      }
+    }
+
+    function setOutputTab(tab) {
+      outputTab = tab === "cards" ? "cards" : "mixed";
+      mixedTabBtn.classList.toggle("active", outputTab === "mixed");
+      cardsTabBtn.classList.toggle("active", outputTab === "cards");
+      if (lastOutputsPayload) {
+        renderOutputs(lastOutputsPayload);
+      }
+    }
+
+    function setStartTab(tab) {
+      const showSettings = tab === "settings";
+      runStartPanel.style.display = showSettings ? "none" : "block";
+      settingsStartPanel.style.display = showSettings ? "block" : "none";
+      runStartTabBtn.classList.toggle("active", !showSettings);
+      settingsStartTabBtn.classList.toggle("active", showSettings);
     }
 
     function renderArtifacts(artifacts) {
@@ -531,6 +697,10 @@
 
     startBtn.addEventListener("click", startRun);
     stopBtn.addEventListener("click", stopRun);
+    runStartTabBtn.addEventListener("click", () => setStartTab("run"));
+    settingsStartTabBtn.addEventListener("click", () => setStartTab("settings"));
+    mixedTabBtn.addEventListener("click", () => setOutputTab("mixed"));
+    cardsTabBtn.addEventListener("click", () => setOutputTab("cards"));
   </script>
 </body>
 </html>

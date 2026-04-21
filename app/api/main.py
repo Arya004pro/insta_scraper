@@ -88,10 +88,14 @@ def _pick_sample(
             return True
 
         media_type = (row.get("media_type") or "").strip().lower()
+        content_type = (row.get("content_type") or "").strip().lower()
         if bucket == "posts":
-            return media_type in {"image_post", "video_post", "carousel_post"}
+            return (
+                media_type in {"image_post", "video_post", "carousel_post"}
+                or content_type == "post"
+            )
         if bucket == "reels":
-            return media_type == "reel"
+            return media_type == "reel" or content_type == "reel"
         return False
 
     best_row: dict[str, str] | None = None
@@ -155,13 +159,16 @@ def _serialize_output_row(row: dict[str, str] | None) -> dict | None:
         post_url = None
 
     media_type = (row.get("media_type") or "").strip().lower()
-    views_count = row.get("views_count") if media_type == "reel" else None
+    content_type = (row.get("content_type") or "").strip().lower()
+    normalized_type = content_type or ("reel" if media_type == "reel" else "post")
+    views_count = row.get("views_count") if normalized_type == "reel" else None
 
     return {
         "shortcode": row.get("shortcode"),
         "post_url": post_url,
         "posted_at_ist": row.get("posted_at_ist"),
         "media_type": row.get("media_type"),
+        "content_type": normalized_type,
         "sample_bucket": row.get("sample_bucket"),
         "likes_count": row.get("likes_count"),
         "comments_count": row.get("comments_count"),
@@ -282,6 +289,29 @@ def _profile_from_summary_row(summary_row: dict[str, str]) -> dict[str, str]:
         "active_ads_url": summary_row.get("Active Ads URL", ""),
         "time_verified": summary_row.get("Time Verified", ""),
     }
+
+
+def _pick_summary_row_for_run(
+    rows: list[dict[str, str]], run_id: str, normalized_profile_url: str | None
+) -> dict[str, str] | None:
+    if not rows:
+        return None
+
+    normalized = (normalized_profile_url or "").strip().lower().rstrip("/")
+    for row in reversed(rows):
+        if (row.get("Run ID") or "").strip() != run_id:
+            continue
+        row_profile = (
+            (row.get("Normalized Profile URL") or "").strip().lower().rstrip("/")
+        )
+        if normalized and row_profile and normalized == row_profile:
+            return row
+
+    for row in reversed(rows):
+        if (row.get("Run ID") or "").strip() == run_id:
+            return row
+
+    return rows[-1]
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -456,26 +486,52 @@ def get_run_report(run_id: str) -> dict:
         }
 
     profile_row: dict[str, str] | None = None
-    profile_csv_path = artifacts.get("profile_csv")
-    if profile_csv_path:
-        rows = _read_csv_rows(Path(profile_csv_path), max_rows=1)
-        profile_row = rows[0] if rows else None
-    if profile_row is None:
-        summary_csv_path = artifacts.get("master_summary_csv")
-        if summary_csv_path:
-            rows = _read_csv_rows(Path(summary_csv_path), max_rows=1)
-            if rows:
-                profile_row = _profile_from_summary_row(rows[0])
+    summary_csv_path = artifacts.get("profiles_rollup_csv") or artifacts.get(
+        "master_summary_csv"
+    )
+    if summary_csv_path:
+        summary_rows = _read_csv_rows(Path(summary_csv_path))
+        picked = _pick_summary_row_for_run(
+            summary_rows,
+            run_id=run_id,
+            normalized_profile_url=run.normalized_profile_url,
+        )
+        if picked:
+            profile_row = _profile_from_summary_row(picked)
 
-    posts_rows: list[dict[str, str]] = []
-    posts_csv_path = artifacts.get("posts_csv")
-    if posts_csv_path:
-        posts_rows = _read_csv_rows(Path(posts_csv_path))
+    content_csv_path = artifacts.get("profile_content_csv")
+    if not content_csv_path:
+        for key in sorted(artifacts.keys()):
+            if key.startswith("profile_content_csv_"):
+                content_csv_path = artifacts[key]
+                break
 
-    reels_rows: list[dict[str, str]] = []
-    reels_csv_path = artifacts.get("reels_csv")
-    if reels_csv_path:
-        reels_rows = _read_csv_rows(Path(reels_csv_path))
+    all_media_rows: list[dict[str, str]] = []
+    if content_csv_path:
+        all_media_rows = _read_csv_rows(Path(content_csv_path))
+    else:
+        posts_csv_path = artifacts.get("posts_csv")
+        reels_csv_path = artifacts.get("reels_csv")
+        if posts_csv_path:
+            all_media_rows.extend(_read_csv_rows(Path(posts_csv_path)))
+        if reels_csv_path:
+            all_media_rows.extend(_read_csv_rows(Path(reels_csv_path)))
+
+    posts_rows = [
+        row
+        for row in all_media_rows
+        if (row.get("content_type") or "").strip().lower() == "post"
+        or (
+            (row.get("content_type") or "").strip() == ""
+            and (row.get("media_type") or "").strip().lower() != "reel"
+        )
+    ]
+    reels_rows = [
+        row
+        for row in all_media_rows
+        if (row.get("content_type") or "").strip().lower() == "reel"
+        or (row.get("media_type") or "").strip().lower() == "reel"
+    ]
 
     external_links_rows: list[dict[str, str]] = []
     external_links_csv_path = artifacts.get("external_links_csv")
@@ -492,8 +548,11 @@ def get_run_report(run_id: str) -> dict:
         for item in (_serialize_output_row(row) for row in reels_rows)
         if item is not None
     ]
-
-    all_media_rows = posts_rows + reels_rows
+    output_mixed = [
+        item
+        for item in (_serialize_output_row(row) for row in all_media_rows)
+        if item is not None
+    ]
 
     samples = {
         "post": _serialize_sample_row(_pick_sample(all_media_rows, "posts")),
@@ -515,9 +574,10 @@ def get_run_report(run_id: str) -> dict:
         "external_links": external_links,
         "samples": samples,
         "outputs": {
+            "mixed": output_mixed,
             "posts": output_posts,
             "reels": output_reels,
-            "total_count": len(output_posts) + len(output_reels),
+            "total_count": len(output_mixed),
         },
         "artifacts": report_artifacts,
     }

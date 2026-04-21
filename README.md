@@ -33,16 +33,16 @@ set PROXY_POOL_JSON=[{"proxy_id":"p1","server":"http://host:port","username":"u"
 set PROXY_ROTATE_EVERY_N=20
 ```
 
-Post cap control (0 or unset means scan all posts):
+Post/reel cap control (default is 50 mixed entities per profile):
 
 ```bash
-set MAX_POSTS_PER_PROFILE=0
+set MAX_POSTS_PER_PROFILE=50
 ```
 
-Sample mode controls (default is enabled for quick test runs):
+Sample mode controls (default is disabled so UI test runs can capture up to the configured entity cap):
 
 ```bash
-set SAMPLE_COLLECTION_MODE=1
+set SAMPLE_COLLECTION_MODE=0
 ```
 
 In sample mode, the scraper targets exactly one sample each for:
@@ -53,10 +53,10 @@ In sample mode, the scraper targets exactly one sample each for:
 
 It first uses timeline snapshot data, then falls back to only currently visible grid items (no deep scroll), which helps reduce 429 rate-limit errors.
 
-To force full crawling behavior instead of sample mode:
+To force sample mode (quick profile sanity runs):
 
 ```bash
-set SAMPLE_COLLECTION_MODE=0
+set SAMPLE_COLLECTION_MODE=1
 ```
 
 Speed tuning controls:
@@ -65,9 +65,13 @@ Speed tuning controls:
 set SCROLL_PAUSE_MIN_MS=450
 set SCROLL_PAUSE_MAX_MS=900
 set POST_DETAIL_WAIT_MS=300
+set POST_DETAIL_NAV_TIMEOUT_MS=12000
+set SCRAPE_RUNTIME_BUDGET_SECONDS=900
 set BROWSER_VIEWPORT_WIDTH=1100
 set BROWSER_VIEWPORT_HEIGHT=750
 ```
+
+`SCRAPE_RUNTIME_BUDGET_SECONDS` is enforced in reels-only stats mode so runs return partial-safe CSV output instead of hanging for very long periods.
 
 Challenge auto-recovery controls (best effort before pausing run):
 
@@ -92,6 +96,10 @@ set BROWSER_HEADLESS=1
     - `input_value`: profile URL or local CSV path
     - `use_saved_session`: bool
     - `proxy_pool_id`: optional
+    - `max_entities`: optional int (for example `50`)
+    - `fast_mode`: optional bool
+    - `reels_only`: optional bool
+    - `stats_only`: optional bool (skip media downloads but keep metadata extraction)
 - `GET /v1/runs/{run_id}`
 - `POST /v1/runs/{run_id}/resume`
 - `GET /v1/runs/{run_id}/artifacts`
@@ -99,11 +107,12 @@ set BROWSER_HEADLESS=1
 
 ## Output
 
-Exports are written to `exports/`:
+Exports are written as two CSV outputs:
 
-- `*_posts.csv`
-- `*_reels.csv`
-- `*_master_summary.csv`
+- Global rollup (all scraped profiles): `exports/instagram_profiles_rollup.csv`
+- Per-profile mixed content CSV (posts + reels): `media/<profile_name>/instagram_<username>_content_latest.csv`
+
+The mixed content CSV includes a `content_type` column (`post` or `reel`), and `views_count` is kept blank for posts.
 
 Sample media files are stored under `scraped_media/<profile_name>/` in the project root:
 

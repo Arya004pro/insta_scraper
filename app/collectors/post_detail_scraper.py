@@ -581,9 +581,11 @@ def scrape_post_detail(
     post_url: str,
     media_type_hint: str | None = None,
     page_settle_ms: int = 700,
+    navigation_timeout_ms: int = 20_000,
 ) -> dict:
+    nav_timeout = max(5_000, int(navigation_timeout_ms or 0))
     for _ in range(2):
-        page.goto(post_url, wait_until="domcontentloaded")
+        page.goto(post_url, wait_until="domcontentloaded", timeout=nav_timeout)
         if page_settle_ms > 0:
             page.wait_for_timeout(page_settle_ms)
 
@@ -591,7 +593,11 @@ def scrape_post_detail(
             break
 
         try:
-            page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
+            page.goto(
+                "https://www.instagram.com/",
+                wait_until="domcontentloaded",
+                timeout=nav_timeout,
+            )
             page.wait_for_timeout(max(600, page_settle_ms))
         except Exception:
             pass

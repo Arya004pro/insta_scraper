@@ -183,8 +183,9 @@ def load_settings() -> Settings:
         "yes",
         "on",
     }
-    sample_mode_raw = os.getenv("SAMPLE_COLLECTION_MODE", "1").strip().lower()
+    sample_mode_raw = os.getenv("SAMPLE_COLLECTION_MODE", "0").strip().lower()
     sample_collection_mode = sample_mode_raw in {"1", "true", "yes", "on"}
+    max_posts_raw = int(os.getenv("MAX_POSTS_PER_PROFILE", "50"))
 
     camoufox_executable_path = _auto_detect_camoufox_executable_path()
     camoufox_user_data_dir = _auto_detect_camoufox_user_data_dir(
@@ -226,10 +227,6 @@ def load_settings() -> Settings:
             os.getenv("RATE_LIMIT_COOLDOWN_SECONDS", "30")
         ),
         sample_collection_mode=sample_collection_mode,
-        max_posts_per_profile=(
-            None
-            if int(os.getenv("MAX_POSTS_PER_PROFILE", "0")) <= 0
-            else int(os.getenv("MAX_POSTS_PER_PROFILE", "0"))
-        ),
+        max_posts_per_profile=(None if max_posts_raw <= 0 else max_posts_raw),
         proxies=proxy_pool,
     )

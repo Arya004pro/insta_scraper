@@ -246,6 +246,49 @@ def _matches_media_filter(media_kind: str | None, media_filter: str) -> bool:
     return True
 
 
+def _advance_grid_scroll(page: object, aggressive: bool = False) -> None:
+    try:
+        page.evaluate(
+            """
+            () => {
+                const step = Math.floor(window.innerHeight * 0.9);
+                window.scrollBy(0, step);
+
+                const scrollers = Array.from(document.querySelectorAll(
+                    "main, section, article, div[role='main'], div[style*='overflow']"
+                ));
+                for (const el of scrollers) {
+                    try {
+                        el.scrollTop = (el.scrollTop || 0) + step;
+                    } catch {}
+                }
+            }
+            """
+        )
+    except Exception:
+        pass
+
+    try:
+        page.mouse.wheel(0, 1400)
+    except Exception:
+        pass
+
+    try:
+        page.keyboard.press("PageDown")
+    except Exception:
+        pass
+
+    if aggressive:
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+        except Exception:
+            pass
+        try:
+            page.keyboard.press("End")
+        except Exception:
+            pass
+
+
 def enumerate_grid_posts(
     page: object,
     settings: Settings,
@@ -349,7 +392,7 @@ def enumerate_grid_posts(
         else:
             idle_rounds = 0
 
-        page.evaluate("window.scrollBy(0, Math.floor(window.innerHeight * 0.9));")
+        _advance_grid_scroll(page, aggressive=idle_rounds >= 2)
         wait_ms = random.randint(
             settings.scroll_pause_min_ms, settings.scroll_pause_max_ms
         )

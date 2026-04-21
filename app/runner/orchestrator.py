@@ -239,6 +239,10 @@ class RunOrchestrator:
                     run_id=run_id,
                     profile_url=target,
                     use_saved_session=req.use_saved_session,
+                    max_entities=req.max_entities,
+                    fast_mode=req.fast_mode,
+                    reels_only=req.reels_only,
+                    stats_only=req.stats_only,
                     resume_state=current_state.get("profile_state")
                     if is_resume
                     else None,
@@ -865,9 +869,19 @@ class RunOrchestrator:
         run_id: str,
         profile_url: str,
         use_saved_session: bool,
+        max_entities: int | None = None,
+        fast_mode: bool = True,
+        reels_only: bool = True,
+        stats_only: bool = True,
         resume_state: dict[str, Any] | None = None,
     ) -> ProfileRunResult:
         resume_state = resume_state or {}
+        strict_runtime_mode_hint = bool(reels_only and stats_only)
+        challenge_retry_attempts = max(0, self.settings.challenge_auto_retry_attempts)
+        challenge_retry_wait_seconds = self.settings.challenge_auto_retry_wait_seconds
+        if strict_runtime_mode_hint:
+            challenge_retry_attempts = min(challenge_retry_attempts, 1)
+            challenge_retry_wait_seconds = min(challenge_retry_wait_seconds, 3.0)
         proxy_manager = ProxyManager(self.settings)
         proxy = proxy_manager.active
         username_hint = profile_url.rstrip("/").split("/")[-1]
@@ -903,11 +917,6 @@ class RunOrchestrator:
                     if not pages:
                         raise
                     page = pages[0]
-
-            try:
-                page.bring_to_front()
-            except Exception:
-                pass
 
             try:
                 page.goto(
@@ -1012,7 +1021,7 @@ class RunOrchestrator:
                 self.store.update_run(run_id, challenge_encountered=True)
                 return False
 
-            attempts = max(0, self.settings.challenge_auto_retry_attempts)
+            attempts = challenge_retry_attempts
             for attempt in range(1, attempts + 1):
                 _check_cancel()
                 self.store.add_event(
@@ -1020,7 +1029,7 @@ class RunOrchestrator:
                     f"Challenge detected ({pattern}). Auto-recovery attempt {attempt}/{attempts}",
                     level="warning",
                 )
-                wait_seconds = self.settings.challenge_auto_retry_wait_seconds
+                wait_seconds = challenge_retry_wait_seconds
                 if wait_seconds > 0:
                     self._sleep_interruptible(run_id, wait_seconds)
 
@@ -1182,6 +1191,72 @@ class RunOrchestrator:
                 resume_state.get("partial_posts_rows", [])
             )
             username = profile_row.get("username") or username_hint
+            entity_limit = (
+                max_entities
+                if isinstance(max_entities, int) and max_entities > 0
+                else self.settings.max_posts_per_profile
+            )
+            stats_only_mode = bool(stats_only)
+            sample_collection_mode = (
+                self.settings.sample_collection_mode and not stats_only_mode
+            )
+            fast_scan_mode = bool(fast_mode) and not sample_collection_mode
+            reels_only_mode = bool(reels_only)
+            force_reel_detail_mode = reels_only_mode and stats_only_mode
+            reels_fast_stats_mode = (
+                fast_scan_mode
+                and reels_only_mode
+                and stats_only_mode
+                and not force_reel_detail_mode
+            )
+            effective_retry_max_attempts = max(1, self.settings.retry_max_attempts)
+            effective_retry_base_delay_seconds = self.settings.retry_base_delay_seconds
+            effective_rate_limit_cooldown_seconds = (
+                self.settings.rate_limit_cooldown_seconds
+            )
+            effective_post_detail_wait_ms = self.settings.post_detail_wait_ms
+            effective_post_detail_nav_timeout_ms = 20_000
+            runtime_budget_seconds = 0
+            if force_reel_detail_mode:
+                effective_retry_max_attempts = min(effective_retry_max_attempts, 2)
+                effective_retry_base_delay_seconds = min(
+                    effective_retry_base_delay_seconds, 0.8
+                )
+                effective_rate_limit_cooldown_seconds = min(
+                    effective_rate_limit_cooldown_seconds, 6.0
+                )
+                effective_post_detail_wait_ms = min(
+                    max(self.settings.post_detail_wait_ms, 120),
+                    220,
+                )
+                effective_post_detail_nav_timeout_ms = min(
+                    max(int(os.getenv("POST_DETAIL_NAV_TIMEOUT_MS", "12000")), 7000),
+                    20_000,
+                )
+                runtime_budget_seconds = max(
+                    0,
+                    int(os.getenv("SCRAPE_RUNTIME_BUDGET_SECONDS", "900")),
+                )
+            profile_started_monotonic = time.monotonic()
+            stop_post_loop_due_runtime_budget = False
+
+            def _should_stop_for_runtime_budget() -> bool:
+                nonlocal stop_post_loop_due_runtime_budget
+                if stop_post_loop_due_runtime_budget:
+                    return True
+                if runtime_budget_seconds <= 0:
+                    return False
+                elapsed = time.monotonic() - profile_started_monotonic
+                if elapsed < runtime_budget_seconds:
+                    return False
+                stop_post_loop_due_runtime_budget = True
+                self.store.add_event(
+                    run_id,
+                    f"Runtime budget reached ({runtime_budget_seconds}s). Exporting partial results to keep this run responsive.",
+                    level="warning",
+                )
+                return True
+
             recent_post_cache = self._load_recent_post_cache(username)
             sample_captured = {
                 "posts": False,
@@ -1190,9 +1265,48 @@ class RunOrchestrator:
             required_samples = {"posts", "reels"}
             consecutive_rate_limits = 0
             stop_post_loop_due_rate_limit = False
-            sample_mode_detail_budget = 6 if self.settings.sample_collection_mode else 0
+            sample_mode_detail_budget = 6 if sample_collection_mode else 0
             sample_mode_detail_used = 0
             timeline_items: list[dict[str, Any]] = []
+
+            if fast_scan_mode:
+                self.store.add_event(
+                    run_id,
+                    "Fast mode enabled: using grid/timeline metrics and skipping per-post detail navigation for speed.",
+                )
+            if reels_only_mode:
+                self.store.add_event(
+                    run_id,
+                    "Reels-only mode enabled: collecting only reel entities for this run.",
+                )
+            if stats_only_mode:
+                self.store.add_event(
+                    run_id,
+                    "Stats-only mode enabled: skipping media-file download and prioritizing reel metrics extraction speed.",
+                )
+            if force_reel_detail_mode:
+                self.store.add_event(
+                    run_id,
+                    "Stats-only reels mode: opening each reel detail page to extract full metadata while skipping media download.",
+                )
+                if runtime_budget_seconds > 0:
+                    self.store.add_event(
+                        run_id,
+                        f"Runtime guard enabled: maximum {runtime_budget_seconds}s for this profile run.",
+                    )
+
+            def _as_int(value: Any) -> int | None:
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, float):
+                    return int(value)
+                if isinstance(value, str) and value.strip():
+                    raw = value.strip().replace(",", "")
+                    try:
+                        return int(float(raw))
+                    except Exception:
+                        return None
+                return None
 
             for row in posts_rows:
                 bucket = row.get("sample_bucket")
@@ -1204,7 +1318,24 @@ class RunOrchestrator:
             reels_tab_by_shortcode: dict[str, dict[str, Any]] = {}
             timeline_rank_by_shortcode: dict[str, int] = {}
             pinned_shortcodes: set[str] = set()
-            if self.settings.sample_collection_mode:
+            enum_settings = self.settings
+            if fast_scan_mode:
+                target_idle_rounds = 6 if reels_fast_stats_mode else 10
+                target_pause_min_ms = 90 if reels_fast_stats_mode else 120
+                target_pause_max_ms = 180 if reels_fast_stats_mode else 240
+                enum_settings = replace(
+                    self.settings,
+                    scroll_idle_rounds=max(
+                        self.settings.scroll_idle_rounds, target_idle_rounds
+                    ),
+                    scroll_pause_min_ms=min(
+                        self.settings.scroll_pause_min_ms, target_pause_min_ms
+                    ),
+                    scroll_pause_max_ms=min(
+                        self.settings.scroll_pause_max_ms, target_pause_max_ms
+                    ),
+                )
+            if sample_collection_mode:
                 self.store.add_event(
                     run_id,
                     "Sample mode enabled: collecting timeline snapshot first to avoid deep scrolling.",
@@ -1254,6 +1385,8 @@ class RunOrchestrator:
                             page,
                             profile_url,
                             wait_ms=max(1200, self.settings.post_detail_wait_ms * 3),
+                            max_items=30,
+                            max_scroll_rounds=8,
                         )
                         reels_tab_by_shortcode = {
                             str(item.get("shortcode")): item
@@ -1352,25 +1485,26 @@ class RunOrchestrator:
                     resume_state=resume_state,
                     media_filter="posts",
                 )
-                if (
-                    self.settings.max_posts_per_profile
-                    and self.settings.max_posts_per_profile > 0
-                ):
-                    discovered = discovered[: self.settings.max_posts_per_profile]
+                if entity_limit and entity_limit > 0:
+                    discovered = discovered[:entity_limit]
                 else:
                     discovered = discovered[:30]
             else:
                 enum_attempts = 0
                 last_enum_error: Exception | None = None
                 discovered_or_none: list[dict[str, Any]] | None = None
-                while enum_attempts < self.settings.retry_max_attempts:
+                if fast_scan_mode and reels_only_mode:
+                    discovered_or_none = []
+                while enum_attempts < effective_retry_max_attempts:
+                    if discovered_or_none is not None:
+                        break
                     enum_attempts += 1
                     try:
                         discovered_or_none = enumerate_grid_posts(
                             page,
-                            self.settings,
+                            enum_settings,
                             resume_state=resume_state,
-                            media_filter="posts",
+                            media_filter="reels" if reels_only_mode else "all",
                         )
                         break
                     except Exception as exc:
@@ -1396,20 +1530,12 @@ class RunOrchestrator:
                     raise RuntimeError("Failed to enumerate posts/reels")
                 discovered = discovered_or_none
 
-                if (
-                    self.settings.max_posts_per_profile
-                    and self.settings.max_posts_per_profile > 0
-                ):
-                    discovered = discovered[: self.settings.max_posts_per_profile]
+                if entity_limit and entity_limit > 0:
+                    discovered = discovered[:entity_limit]
                     self.store.add_event(
                         run_id,
-                        f"Post discovery limited to first {self.settings.max_posts_per_profile} items",
+                        f"Grid discovery limited to first {entity_limit} mixed entities.",
                     )
-
-            def _is_reel_discovered(item: dict[str, Any]) -> bool:
-                media_hint = (item.get("media_type_hint") or "").strip().lower()
-                post_url = (item.get("post_url") or "").strip().lower()
-                return media_hint == "reel" or "/reel/" in post_url
 
             def _merge_discovered_rows(
                 posts_discovered: list[dict[str, Any]],
@@ -1443,22 +1569,46 @@ class RunOrchestrator:
                             existing[key] = row.get(key)
                 return list(ordered.values())
 
-            mixed_posts_discovered = [
-                x for x in discovered if not _is_reel_discovered(x)
-            ]
+            mixed_posts_discovered = [] if reels_only_mode else list(discovered)
             reels_discovered: list[dict[str, Any]] = []
             reels_scan_settings = replace(
-                self.settings,
-                scroll_idle_rounds=0
-                if self.settings.sample_collection_mode
-                else self.settings.scroll_idle_rounds,
+                enum_settings,
+                scroll_idle_rounds=(
+                    0
+                    if sample_collection_mode
+                    else max(3, min(enum_settings.scroll_idle_rounds, 5))
+                    if reels_fast_stats_mode
+                    else enum_settings.scroll_idle_rounds
+                ),
+                scroll_pause_min_ms=(
+                    min(enum_settings.scroll_pause_min_ms, 90)
+                    if reels_fast_stats_mode
+                    else enum_settings.scroll_pause_min_ms
+                ),
+                scroll_pause_max_ms=(
+                    min(enum_settings.scroll_pause_max_ms, 180)
+                    if reels_fast_stats_mode
+                    else enum_settings.scroll_pause_max_ms
+                ),
             )
 
             try:
                 reels_from_graphql = collect_recent_reels_tab_items(
                     page,
                     profile_url,
-                    wait_ms=max(1500, self.settings.post_detail_wait_ms * 4),
+                    wait_ms=(
+                        max(700, self.settings.post_detail_wait_ms * 2)
+                        if reels_fast_stats_mode
+                        else max(1500, self.settings.post_detail_wait_ms * 4)
+                    ),
+                    max_items=(
+                        entity_limit if entity_limit and entity_limit > 0 else 120
+                    ),
+                    max_scroll_rounds=(
+                        max(8, self.settings.scroll_idle_rounds * 2)
+                        if reels_fast_stats_mode
+                        else max(12, self.settings.scroll_idle_rounds * 4)
+                    ),
                 )
                 reels_discovered = [
                     {
@@ -1518,6 +1668,101 @@ class RunOrchestrator:
                         resume_state=resume_state,
                         media_filter="reels",
                     )
+
+                target_entities = (
+                    entity_limit
+                    if (
+                        not sample_collection_mode and entity_limit and entity_limit > 0
+                    )
+                    else None
+                )
+                if target_entities and len(reels_discovered) < target_entities:
+                    reels_url = f"{profile_url.rstrip('/')}/reels/"
+                    expand_passes = 0
+                    no_growth_rounds = 0
+                    while (
+                        len(reels_discovered) < target_entities
+                        and expand_passes < 4
+                        and no_growth_rounds < 2
+                    ):
+                        expand_passes += 1
+                        before = len(reels_discovered)
+
+                        page.goto(reels_url, wait_until="domcontentloaded")
+                        page.wait_for_timeout(
+                            max(400, self.settings.post_detail_wait_ms)
+                        )
+
+                        reels_grid_rows = enumerate_grid_posts(
+                            page,
+                            replace(
+                                reels_scan_settings,
+                                scroll_idle_rounds=max(
+                                    reels_scan_settings.scroll_idle_rounds,
+                                    10,
+                                ),
+                                scroll_pause_min_ms=min(
+                                    reels_scan_settings.scroll_pause_min_ms,
+                                    120,
+                                ),
+                                scroll_pause_max_ms=min(
+                                    reels_scan_settings.scroll_pause_max_ms,
+                                    260,
+                                ),
+                            ),
+                            resume_state=resume_state,
+                            media_filter="reels",
+                        )
+                        if reels_grid_rows:
+                            reels_discovered = _merge_discovered_rows(
+                                [], reels_discovered + reels_grid_rows
+                            )
+
+                        # Retry reels-tab GraphQL fetch after deep scroll to absorb newly loaded batches.
+                        try:
+                            reels_retry = collect_recent_reels_tab_items(
+                                page,
+                                profile_url,
+                                wait_ms=max(900, self.settings.post_detail_wait_ms * 3),
+                                max_items=target_entities,
+                                max_scroll_rounds=max(
+                                    14, self.settings.scroll_idle_rounds * 4
+                                ),
+                            )
+                            if reels_retry:
+                                retry_rows = [
+                                    {
+                                        "shortcode": row.get("shortcode"),
+                                        "post_url": row.get("post_url"),
+                                        "media_type_hint": "reel",
+                                        "posted_at_ist": row.get("posted_at_ist"),
+                                        "taken_at_epoch": row.get("taken_at_epoch"),
+                                        "is_pinned": row.get("is_pinned"),
+                                        "thumbnail_url": row.get("thumbnail_url"),
+                                        "likes_count": row.get("likes_count"),
+                                        "comments_count": row.get("comments_count"),
+                                        "views_count": row.get("views_count"),
+                                        "repost_count": row.get("repost_count"),
+                                    }
+                                    for row in reels_retry
+                                    if row.get("shortcode")
+                                ]
+                                if retry_rows:
+                                    reels_discovered = _merge_discovered_rows(
+                                        [], reels_discovered + retry_rows
+                                    )
+                        except Exception:
+                            pass
+
+                        growth = len(reels_discovered) - before
+                        if growth > 0:
+                            no_growth_rounds = 0
+                            self.store.add_event(
+                                run_id,
+                                f"Expanded reels discovery by {growth} rows (pass {expand_passes}); total reels discovered: {len(reels_discovered)}.",
+                            )
+                        else:
+                            no_growth_rounds += 1
                 self.store.add_event(
                     run_id,
                     f"Discovered {len(reels_discovered)} reels from reels tab.",
@@ -1543,6 +1788,26 @@ class RunOrchestrator:
             discovered = _merge_discovered_rows(
                 mixed_posts_discovered, reels_discovered
             )
+
+            if reels_only_mode:
+                discovered = [
+                    row
+                    for row in discovered
+                    if (str(row.get("media_type_hint") or "").strip().lower() == "reel")
+                    or "/reel/" in str(row.get("post_url") or "").strip().lower()
+                ]
+
+            if (
+                not sample_collection_mode
+                and entity_limit
+                and entity_limit > 0
+                and len(discovered) > entity_limit
+            ):
+                discovered = discovered[:entity_limit]
+                self.store.add_event(
+                    run_id,
+                    f"Mixed post/reel extraction limited to first {entity_limit} entities.",
+                )
 
             if timeline_by_shortcode and discovered:
                 for item in discovered:
@@ -1597,7 +1862,7 @@ class RunOrchestrator:
             if not grid_challenge_cleared:
                 discovered = []
 
-            if self.settings.sample_collection_mode and discovered:
+            if sample_collection_mode and discovered:
                 if pinned_shortcodes:
                     non_pinned = [
                         item
@@ -1655,13 +1920,15 @@ class RunOrchestrator:
 
             for i, post in enumerate(discovered):
                 _check_cancel()
+                if _should_stop_for_runtime_budget():
+                    break
                 shortcode = post.get("shortcode")
                 if not shortcode or shortcode in processed:
                     continue
                 timeline_fallback = timeline_by_shortcode.get(str(shortcode), {})
                 reels_tab_fallback = reels_tab_by_shortcode.get(str(shortcode), {})
 
-                if self.settings.sample_collection_mode:
+                if sample_collection_mode:
                     if all(sample_captured[b] for b in required_samples):
                         break
                     if sample_mode_detail_used >= sample_mode_detail_budget:
@@ -1683,6 +1950,124 @@ class RunOrchestrator:
                     if media_hint == "posts" and sample_captured["posts"]:
                         continue
 
+                if fast_scan_mode and not force_reel_detail_mode:
+                    cached_row = recent_post_cache.get(str(shortcode)) or {}
+                    media_type = (
+                        (cached_row.get("media_type") or "").strip()
+                        or post.get("media_type_hint")
+                        or (
+                            "reel"
+                            if "/reel/" in str(post.get("post_url") or "").lower()
+                            else "image_post"
+                        )
+                    )
+                    if reels_only_mode and media_type != "reel":
+                        continue
+
+                    likes_count = _as_int(post.get("likes_count"))
+                    if likes_count is None:
+                        likes_count = _as_int(timeline_fallback.get("likes_count"))
+                    if likes_count is None:
+                        likes_count = _as_int(reels_tab_fallback.get("likes_count"))
+                    if likes_count is None:
+                        likes_count = _as_int(cached_row.get("likes_count"))
+
+                    comments_count = _as_int(post.get("comments_count"))
+                    if comments_count is None:
+                        comments_count = _as_int(
+                            timeline_fallback.get("comments_count")
+                        )
+                    if comments_count is None:
+                        comments_count = _as_int(
+                            reels_tab_fallback.get("comments_count")
+                        )
+                    if comments_count is None:
+                        comments_count = _as_int(cached_row.get("comments_count"))
+
+                    repost_count = _as_int(post.get("repost_count"))
+                    if repost_count is None:
+                        repost_count = _as_int(timeline_fallback.get("repost_count"))
+                    if repost_count is None:
+                        repost_count = _as_int(reels_tab_fallback.get("repost_count"))
+                    if repost_count is None:
+                        repost_count = _as_int(cached_row.get("repost_count"))
+
+                    views_count = _as_int(post.get("views_count"))
+                    if views_count is None:
+                        views_count = _as_int(timeline_fallback.get("views_count"))
+                    if views_count is None:
+                        views_count = _as_int(reels_tab_fallback.get("views_count"))
+                    if views_count is None:
+                        views_count = _as_int(cached_row.get("views_count"))
+                    if media_type != "reel":
+                        views_count = None
+
+                    posted_at_ist = (
+                        post.get("posted_at_ist")
+                        or timeline_fallback.get("posted_at_ist")
+                        or reels_tab_fallback.get("posted_at_ist")
+                        or (cached_row.get("posted_at_ist") or "").strip()
+                        or None
+                    )
+
+                    remote_urls: list[str] = []
+                    for source in (
+                        post.get("media_asset_urls") or [],
+                        timeline_fallback.get("media_asset_urls") or [],
+                        reels_tab_fallback.get("media_asset_urls") or [],
+                    ):
+                        for url in source:
+                            if (
+                                isinstance(url, str)
+                                and url.startswith(("http://", "https://"))
+                                and url not in remote_urls
+                            ):
+                                remote_urls.append(url)
+                    if not remote_urls:
+                        thumb = post.get("thumbnail_url")
+                        if isinstance(thumb, str) and thumb.startswith(
+                            ("http://", "https://")
+                        ):
+                            remote_urls.append(thumb)
+
+                    fast_row = {
+                        "scraped_at_ist": scraped_at,
+                        "run_id": run_id,
+                        "username": username,
+                        "shortcode": shortcode,
+                        "post_url": post.get("post_url"),
+                        "media_type": media_type,
+                        "posted_at_ist": posted_at_ist,
+                        "likes_count": likes_count,
+                        "comments_count": comments_count,
+                        "views_count": views_count,
+                        "repost_count": repost_count,
+                        "is_remix_repost": timeline_fallback.get("is_remix_repost"),
+                        "is_tagged_post": timeline_fallback.get("is_tagged_post"),
+                        "tagged_users_count": timeline_fallback.get(
+                            "tagged_users_count"
+                        ),
+                        "hashtags_csv": timeline_fallback.get("hashtags_csv"),
+                        "keywords_csv": timeline_fallback.get("keywords_csv"),
+                        "mentions_csv": timeline_fallback.get("mentions_csv"),
+                        "caption_text": timeline_fallback.get("caption_text"),
+                        "location_name": timeline_fallback.get("location_name"),
+                        "media_asset_urls_csv": ",".join(remote_urls)
+                        if remote_urls
+                        else None,
+                        "media_asset_local_paths_csv": None,
+                        "sample_bucket": self._sample_bucket_for_media_type(media_type),
+                        "missing_reason_post": "fast_mode_grid",
+                    }
+                    if cached_row:
+                        self._hydrate_row_from_cache(fast_row, cached_row)
+                    if fast_row.get("media_type") != "reel":
+                        fast_row["views_count"] = None
+
+                    posts_rows.append({k: fast_row.get(k) for k in POSTS_COLUMNS})
+                    processed.add(shortcode)
+                    continue
+
                 previous_proxy_id = proxy_manager.current_proxy_id()
                 active_proxy = proxy_manager.mark_request()
                 current_proxy_id = active_proxy.proxy_id if active_proxy else None
@@ -1703,19 +2088,25 @@ class RunOrchestrator:
 
                 attempts = 0
                 last_error: Exception | None = None
-                while attempts < self.settings.retry_max_attempts:
+                while attempts < effective_retry_max_attempts:
                     _check_cancel()
+                    if _should_stop_for_runtime_budget():
+                        break
                     attempts += 1
                     try:
-                        if self.settings.sample_collection_mode:
+                        if sample_collection_mode:
                             sample_mode_detail_used += 1
 
                         detail = scrape_post_detail(
                             page,
                             post["post_url"],
                             media_type_hint=post.get("media_type_hint"),
-                            page_settle_ms=self.settings.post_detail_wait_ms,
+                            page_settle_ms=effective_post_detail_wait_ms,
+                            navigation_timeout_ms=effective_post_detail_nav_timeout_ms,
                         )
+                        if reels_only_mode and detail.get("media_type") != "reel":
+                            processed.add(shortcode)
+                            break
 
                         # Fill sparse detail fields from nearby sources before persisting.
                         if detail.get("likes_count") is None:
@@ -1833,7 +2224,8 @@ class RunOrchestrator:
 
                         media_asset_local_paths: list[str] = []
                         if (
-                            sample_bucket
+                            not stats_only_mode
+                            and sample_bucket
                             and not sample_captured[sample_bucket]
                             and media_asset_urls
                         ):
@@ -1896,7 +2288,7 @@ class RunOrchestrator:
                                 }
                             },
                         )
-                        if self.settings.sample_collection_mode and all(
+                        if sample_collection_mode and all(
                             sample_captured[b] for b in required_samples
                         ):
                             self.store.add_event(
@@ -1911,12 +2303,12 @@ class RunOrchestrator:
                         if is_rate_limited:
                             consecutive_rate_limits += 1
 
-                            if self.settings.sample_collection_mode:
+                            if sample_collection_mode:
                                 cooldown = max(
                                     4.0,
                                     min(
                                         25.0,
-                                        self.settings.rate_limit_cooldown_seconds
+                                        effective_rate_limit_cooldown_seconds
                                         * attempts,
                                     ),
                                 )
@@ -1952,7 +2344,7 @@ class RunOrchestrator:
 
                             cooldown = max(
                                 1.0,
-                                self.settings.rate_limit_cooldown_seconds * attempts,
+                                effective_rate_limit_cooldown_seconds * attempts,
                             )
                             jitter = random.uniform(0.15, 0.45) * cooldown
                             cooldown = cooldown + jitter
@@ -1992,7 +2384,7 @@ class RunOrchestrator:
                                 stop_post_loop_due_rate_limit = True
                                 break
                             continue
-                        if attempts == self.settings.retry_max_attempts:
+                        if attempts == effective_retry_max_attempts:
                             _log_problem_diagnostics(
                                 stage=f"post_detail_{i + 1}",
                                 reason=f"exception:{type(exc).__name__}:{exc}",
@@ -2018,7 +2410,7 @@ class RunOrchestrator:
                                 _relaunch_browser_session(
                                     f"Browser context closed while scraping post {i + 1}; retrying in fresh session"
                                 )
-                        wait_seconds = self.settings.retry_base_delay_seconds * attempts
+                        wait_seconds = effective_retry_base_delay_seconds * attempts
                         self._sleep_interruptible(run_id, wait_seconds)
                         rotated_proxy = proxy_manager.rotate_now()
                         if rotated_proxy:
@@ -2056,12 +2448,16 @@ class RunOrchestrator:
                         cached_media_type
                     ) or self._sample_bucket_for_media_type(post.get("media_type_hint"))
                     if (
-                        self.settings.sample_collection_mode
+                        sample_collection_mode
                         and hint_sample_bucket
                         and not sample_captured[hint_sample_bucket]
                     ):
                         fallback_sample_bucket = hint_sample_bucket
-                        if fallback_sample_bucket == "posts" and fallback_remote_urls:
+                        if (
+                            not stats_only_mode
+                            and fallback_sample_bucket == "posts"
+                            and fallback_remote_urls
+                        ):
                             fallback_local_paths = self._download_sample_media_assets(
                                 run_id=run_id,
                                 username=username,
@@ -2176,27 +2572,24 @@ class RunOrchestrator:
                     ):
                         sample_captured[fallback_sample_bucket] = True
 
-                    should_append_error_row = (
-                        not self.settings.sample_collection_mode
-                        or bool(fallback_sample_bucket)
+                    should_append_error_row = not sample_collection_mode or bool(
+                        fallback_sample_bucket
                     )
                     if should_append_error_row:
                         posts_rows.append(fallback_row)
                     processed.add(shortcode)
 
-                if self.settings.sample_collection_mode and all(
+                if sample_collection_mode and all(
                     sample_captured[b] for b in required_samples
                 ):
                     break
 
                 if stop_post_loop_due_rate_limit:
                     break
+                if stop_post_loop_due_runtime_budget:
+                    break
 
-            if (
-                self.settings.sample_collection_mode
-                and timeline_items
-                and len(posts_rows) < 3
-            ):
+            if sample_collection_mode and timeline_items and len(posts_rows) < 3:
 
                 def _pick_timeline_candidate(
                     bucket: str, include_pinned: bool
@@ -2286,11 +2679,7 @@ class RunOrchestrator:
                         level="warning",
                     )
 
-            if (
-                self.settings.sample_collection_mode
-                and len(posts_rows) < 3
-                and discovered
-            ):
+            if sample_collection_mode and len(posts_rows) < 3 and discovered:
                 backfilled_grid = 0
                 for bucket in ("posts", "reels"):
                     _check_cancel()
@@ -2403,7 +2792,7 @@ class RunOrchestrator:
                         level="warning",
                     )
 
-            if self.settings.sample_collection_mode and posts_rows:
+            if sample_collection_mode and posts_rows:
 
                 def _bucket_for_row(row: dict[str, Any]) -> str | None:
                     bucket = row.get("sample_bucket")
@@ -2531,19 +2920,50 @@ class RunOrchestrator:
             "error_message": run.error_message,
         }
         run_log_rows = [{k: run_log_row.get(k) for k in RUN_LOG_COLUMNS}]
-        profile_row = (
-            profile_rows[0]
-            if profile_rows
-            else {"scraped_at_ist": run_log_row["scraped_at_ist"], "run_id": run_id}
-        )
-        summary_flat_rows = build_summary_flat(
-            run_log_row=run_log_row,
-            profile_row=profile_row,
-            aggregate_rows=aggregate_rows,
-            highlights_rows=highlights_rows,
-            external_links_rows=external_links_rows,
-            posts_rows=posts_rows,
-        )
+        summary_flat_rows: list[dict[str, Any]] = []
+        if profile_rows:
+            for profile_row in profile_rows:
+                username = str(profile_row.get("username") or "").strip()
+
+                def _belongs_to_username(row: dict[str, Any]) -> bool:
+                    row_username = str(row.get("username") or "").strip()
+                    if username:
+                        return row_username == username
+                    return True
+
+                profile_aggregates = [
+                    row for row in aggregate_rows if _belongs_to_username(row)
+                ]
+                profile_highlights = [
+                    row for row in highlights_rows if _belongs_to_username(row)
+                ]
+                profile_links = [
+                    row for row in external_links_rows if _belongs_to_username(row)
+                ]
+                profile_posts = [row for row in posts_rows if _belongs_to_username(row)]
+
+                summary_flat_rows.extend(
+                    build_summary_flat(
+                        run_log_row=run_log_row,
+                        profile_row=profile_row,
+                        aggregate_rows=profile_aggregates,
+                        highlights_rows=profile_highlights,
+                        external_links_rows=profile_links,
+                        posts_rows=profile_posts,
+                    )
+                )
+        else:
+            summary_flat_rows = build_summary_flat(
+                run_log_row=run_log_row,
+                profile_row={
+                    "scraped_at_ist": run_log_row["scraped_at_ist"],
+                    "run_id": run_id,
+                },
+                aggregate_rows=[],
+                highlights_rows=[],
+                external_links_rows=[],
+                posts_rows=[],
+            )
 
         ts = now_ist().strftime("%Y-%m-%d_%H-%M-%S")
         profile_username = (profile_row.get("username") or "").strip().lower()
@@ -2557,6 +2977,7 @@ class RunOrchestrator:
         artifacts.update(
             export_csv_artifacts(
                 exports_dir=self.settings.exports_dir,
+                media_dir=self.settings.media_dir,
                 base_name=base_name,
                 run_log_rows=run_log_rows,
                 profile_rows=profile_rows,

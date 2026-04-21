@@ -298,14 +298,97 @@ def collect_recent_reels_tab_items(
     page: object,
     profile_url: str,
     wait_ms: int = 4500,
+    max_items: int = 50,
+    max_scroll_rounds: int = 12,
 ) -> list[dict[str, Any]]:
-    reels_payload: dict[str, Any] | None = None
+    reels_rows_by_shortcode: dict[str, dict[str, Any]] = {}
+    has_next_page = True
+
+    def _absorb_payload(payload: dict[str, Any]) -> None:
+        nonlocal has_next_page
+        edges = payload.get("edges") or []
+
+        page_info = payload.get("page_info")
+        if isinstance(page_info, dict) and "has_next_page" in page_info:
+            has_next_page = bool(page_info.get("has_next_page"))
+
+        for edge in edges:
+            node = edge.get("node") if isinstance(edge, dict) else None
+            if not isinstance(node, dict):
+                continue
+
+            media = node.get("media") if isinstance(node.get("media"), dict) else node
+            if not isinstance(media, dict):
+                continue
+
+            shortcode = media.get("code")
+            if not isinstance(shortcode, str) or not shortcode:
+                continue
+
+            play_or_view = media.get("play_count") or media.get("view_count")
+            try:
+                views_count = int(play_or_view) if play_or_view is not None else None
+            except Exception:
+                views_count = None
+
+            repost_count = _extract_repost_count(media)
+            if repost_count is None:
+                repost_count = _extract_repost_count(node)
+
+            taken_at_epoch = _to_int(media.get("taken_at"))
+
+            try:
+                likes_count = int(media.get("like_count"))
+            except Exception:
+                likes_count = None
+
+            try:
+                comments_count = int(media.get("comment_count"))
+            except Exception:
+                comments_count = None
+
+            image_url = None
+            image_versions = media.get("image_versions2")
+            if isinstance(image_versions, dict):
+                image_url = _best_image_url(image_versions)
+
+            candidate = {
+                "shortcode": shortcode,
+                "post_url": f"https://www.instagram.com/reel/{shortcode}/",
+                "media_type": "reel",
+                "sample_bucket": "reels",
+                "taken_at_epoch": taken_at_epoch,
+                "posted_at_ist": _to_iso_ist_from_epoch(media.get("taken_at")),
+                "likes_count": likes_count,
+                "comments_count": comments_count,
+                "views_count": views_count,
+                "repost_count": repost_count,
+                "is_pinned": _is_pinned_node(media) or _is_pinned_node(node),
+                "thumbnail_url": image_url,
+                "media_asset_urls": [image_url] if image_url else [],
+            }
+
+            existing = reels_rows_by_shortcode.get(shortcode)
+            if existing is None:
+                reels_rows_by_shortcode[shortcode] = candidate
+            else:
+                for key in (
+                    "posted_at_ist",
+                    "taken_at_epoch",
+                    "likes_count",
+                    "comments_count",
+                    "views_count",
+                    "repost_count",
+                    "thumbnail_url",
+                    "media_asset_urls",
+                ):
+                    if existing.get(key) in {None, ""} and candidate.get(key) not in {
+                        None,
+                        "",
+                    }:
+                        existing[key] = candidate.get(key)
 
     def _on_response(response: Any) -> None:
-        nonlocal reels_payload
-        if reels_payload is not None:
-            return
-
         ctype = (response.headers.get("content-type") or "").lower()
         if "application/json" not in ctype:
             return
@@ -323,72 +406,67 @@ def collect_recent_reels_tab_items(
 
         payload = data.get("xdt_api__v1__clips__user__connection_v2")
         if isinstance(payload, dict):
-            reels_payload = payload
+            _absorb_payload(payload)
 
     page.on("response", _on_response)
     page.goto(f"{profile_url.rstrip('/')}/reels/", wait_until="domcontentloaded")
     if wait_ms > 0:
         page.wait_for_timeout(wait_ms)
 
-    edges = (reels_payload or {}).get("edges") or []
-    results: list[dict[str, Any]] = []
+    idle_rounds = 0
+    for _ in range(max(0, max_scroll_rounds)):
+        if max_items > 0 and len(reels_rows_by_shortcode) >= max_items:
+            break
 
-    for edge in edges:
-        node = edge.get("node") if isinstance(edge, dict) else None
-        if not isinstance(node, dict):
-            continue
-
-        media = node.get("media") if isinstance(node.get("media"), dict) else node
-        if not isinstance(media, dict):
-            continue
-
-        shortcode = media.get("code")
-        if not isinstance(shortcode, str) or not shortcode:
-            continue
-
-        play_or_view = media.get("play_count") or media.get("view_count")
+        before = len(reels_rows_by_shortcode)
         try:
-            views_count = int(play_or_view) if play_or_view is not None else None
+            page.evaluate(
+                """
+                () => {
+                    const step = Math.floor(window.innerHeight * 0.9);
+                    window.scrollBy(0, step);
+                    const main = document.querySelector('main');
+                    if (main) {
+                        try { main.scrollTop = (main.scrollTop || 0) + step; } catch {}
+                    }
+                }
+                """
+            )
         except Exception:
-            views_count = None
-
-        repost_count = _extract_repost_count(media)
-        if repost_count is None:
-            repost_count = _extract_repost_count(node)
-
-        taken_at_epoch = _to_int(media.get("taken_at"))
-
+            pass
         try:
-            likes_count = int(media.get("like_count"))
+            page.mouse.wheel(0, 1600)
         except Exception:
-            likes_count = None
-
+            pass
         try:
-            comments_count = int(media.get("comment_count"))
+            page.keyboard.press("PageDown")
         except Exception:
-            comments_count = None
+            pass
 
-        image_url = None
-        image_versions = media.get("image_versions2")
-        if isinstance(image_versions, dict):
-            image_url = _best_image_url(image_versions)
+        page.wait_for_timeout(max(500, wait_ms // 4 if wait_ms > 0 else 500))
 
-        results.append(
-            {
-                "shortcode": shortcode,
-                "post_url": f"https://www.instagram.com/reel/{shortcode}/",
-                "media_type": "reel",
-                "sample_bucket": "reels",
-                "taken_at_epoch": taken_at_epoch,
-                "posted_at_ist": _to_iso_ist_from_epoch(media.get("taken_at")),
-                "likes_count": likes_count,
-                "comments_count": comments_count,
-                "views_count": views_count,
-                "repost_count": repost_count,
-                "is_pinned": _is_pinned_node(media) or _is_pinned_node(node),
-                "thumbnail_url": image_url,
-                "media_asset_urls": [image_url] if image_url else [],
-            }
-        )
+        if len(reels_rows_by_shortcode) == before:
+            idle_rounds += 1
+        else:
+            idle_rounds = 0
 
-    return results
+        if idle_rounds >= 5 and not has_next_page:
+            break
+        if idle_rounds >= 7:
+            break
+
+    try:
+        page.remove_listener("response", _on_response)
+    except Exception:
+        pass
+
+    rows = list(reels_rows_by_shortcode.values())
+    rows.sort(
+        key=lambda x: (
+            x.get("taken_at_epoch") if isinstance(x.get("taken_at_epoch"), int) else 0
+        ),
+        reverse=True,
+    )
+    if max_items > 0:
+        rows = rows[:max_items]
+    return rows
