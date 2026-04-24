@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import re
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -14,6 +16,7 @@ from app.core.models import (
     ResumeRunRequest,
     RunArtifactsResponse,
     RunStatusResponse,
+    SyncReelsCountsRequest,
     StartRunRequest,
 )
 from app.core.url_validator import InvalidInstagramUrl
@@ -77,6 +80,24 @@ def _output_url_from_local_path(local_path: str) -> str | None:
         return f"/output/{quote(rel)}"
     except Exception:
         return None
+
+
+def _persist_uploaded_sync_csv(
+    source_csv_text: str, source_csv_filename: str | None
+) -> Path:
+    uploads_dir = settings.media_dir / "_uploaded_sync_sources"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_name = (source_csv_filename or "uploaded_reels.csv").strip()
+    base_name = Path(raw_name).name
+    stem = Path(base_name).stem or "uploaded_reels"
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+    if not safe_stem:
+        safe_stem = "uploaded_reels"
+
+    target = uploads_dir / f"{safe_stem}_{uuid.uuid4().hex[:10]}.csv"
+    target.write_text(source_csv_text, encoding="utf-8", newline="")
+    return target
 
 
 def _pick_sample(
@@ -148,6 +169,13 @@ def _serialize_output_row(row: dict[str, str] | None) -> dict | None:
     if not row:
         return None
 
+    def _latest_count(field: str) -> str | None:
+        updated = (row.get(f"updated_{field}") or "").strip()
+        if updated:
+            return updated
+        base = row.get(field)
+        return base
+
     local_paths = _split_csv_values(row.get("media_asset_local_paths_csv") or "")
     media_asset_urls = [
         u
@@ -161,7 +189,7 @@ def _serialize_output_row(row: dict[str, str] | None) -> dict | None:
     media_type = (row.get("media_type") or "").strip().lower()
     content_type = (row.get("content_type") or "").strip().lower()
     normalized_type = content_type or ("reel" if media_type == "reel" else "post")
-    views_count = row.get("views_count") if normalized_type == "reel" else None
+    views_count = _latest_count("views_count") if normalized_type == "reel" else None
 
     return {
         "shortcode": row.get("shortcode"),
@@ -170,16 +198,26 @@ def _serialize_output_row(row: dict[str, str] | None) -> dict | None:
         "media_type": row.get("media_type"),
         "content_type": normalized_type,
         "sample_bucket": row.get("sample_bucket"),
-        "likes_count": row.get("likes_count"),
-        "comments_count": row.get("comments_count"),
+        "likes_count": _latest_count("likes_count"),
+        "comments_count": _latest_count("comments_count"),
         "views_count": views_count,
-        "repost_count": row.get("repost_count"),
+        "repost_count": _latest_count("repost_count"),
+        "updated_likes_count": row.get("updated_likes_count"),
+        "updated_comments_count": row.get("updated_comments_count"),
+        "updated_views_count": row.get("updated_views_count"),
+        "updated_repost_count": row.get("updated_repost_count"),
+        "sync_checked_at_ist": row.get("sync_checked_at_ist"),
+        "old_likes_count": row.get("likes_count"),
+        "old_comments_count": row.get("comments_count"),
+        "old_views_count": row.get("views_count"),
+        "old_repost_count": row.get("repost_count"),
         "is_remix_repost": row.get("is_remix_repost"),
         "is_tagged_post": row.get("is_tagged_post"),
         "tagged_users_count": row.get("tagged_users_count"),
         "hashtags_csv": row.get("hashtags_csv"),
         "keywords_csv": row.get("keywords_csv"),
         "mentions_csv": row.get("mentions_csv"),
+        "collaborators_csv": row.get("collaborators_csv"),
         "caption_text": row.get("caption_text"),
         "location_name": row.get("location_name"),
         "missing_reason_post": row.get("missing_reason_post"),
@@ -580,4 +618,42 @@ def get_run_report(run_id: str) -> dict:
             "total_count": len(output_mixed),
         },
         "artifacts": report_artifacts,
+    }
+
+
+@app.post("/v1/reels/sync-counts")
+def sync_existing_reel_counts(req: SyncReelsCountsRequest) -> dict:
+    source_csv_path = req.source_csv_path
+    if req.source_csv_text:
+        persisted_source = _persist_uploaded_sync_csv(
+            source_csv_text=req.source_csv_text,
+            source_csv_filename=req.source_csv_filename,
+        )
+        source_csv_path = str(persisted_source)
+
+    try:
+        result = orchestrator.sync_existing_reels_counts(
+            profile_url=req.profile_url,
+            source_csv_path=source_csv_path,
+            use_saved_session=req.use_saved_session,
+            max_reels=req.max_reels,
+        )
+    except InvalidInstagramUrl as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Could not sync reel counts: {exc}"
+        ) from exc
+
+    synced_path = Path(result.get("synced_csv") or "")
+    source_path = Path(result.get("source_csv") or "")
+
+    return {
+        **result,
+        "synced_csv_output_url": _output_url_from_local_path(str(synced_path)),
+        "source_csv_output_url": _output_url_from_local_path(str(source_path)),
     }

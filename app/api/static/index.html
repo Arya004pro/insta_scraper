@@ -66,6 +66,16 @@
       padding: 8px 10px;
       font-size: 14px;
     }
+    input[type="file"] {
+      flex: 1;
+      min-width: 240px;
+      background: #0f1d28;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 13px;
+    }
     .checkbox-row {
       display: inline-flex;
       align-items: center;
@@ -242,6 +252,19 @@
       </section>
 
       <section class="card">
+        <h3 style="margin:0 0 8px;">Sync Existing Reel Counts</h3>
+        <div class="row">
+          <input id="syncCsvFileInput" type="file" accept=".csv,text/csv" />
+          <input id="syncCsvPathInput" type="text" placeholder="Optional fallback: existing reel CSV path" />
+          <input id="syncMaxReelsInput" type="number" min="1" max="5000" step="1" value="50" />
+          <button id="syncBtn" type="button">Sync Latest Counts</button>
+        </div>
+        <div class="small" style="margin-top:8px;">Choose a CSV file directly, or leave file empty and use a path/default latest CSV.</div>
+        <div id="syncStatusText" class="small" style="margin-top:8px;">No sync executed yet.</div>
+        <div id="syncResultBox" class="small" style="margin-top:8px;"></div>
+      </section>
+
+      <section class="card">
         <h3 style="margin:0 0 8px;">Profile Snapshot</h3>
         <div id="profileBox" class="small">No report loaded yet.</div>
       </section>
@@ -283,6 +306,12 @@
     const runStatusEl = document.getElementById("runStatus");
     const progressTextEl = document.getElementById("progressText");
     const errorTextEl = document.getElementById("errorText");
+    const syncCsvFileInput = document.getElementById("syncCsvFileInput");
+    const syncCsvPathInput = document.getElementById("syncCsvPathInput");
+    const syncMaxReelsInput = document.getElementById("syncMaxReelsInput");
+    const syncBtn = document.getElementById("syncBtn");
+    const syncStatusText = document.getElementById("syncStatusText");
+    const syncResultBox = document.getElementById("syncResultBox");
     const profileBox = document.getElementById("profileBox");
     const sampleBox = document.getElementById("sampleBox");
     const outputBox = document.getElementById("outputBox");
@@ -328,6 +357,15 @@
         notation: "compact",
         maximumFractionDigits: 1,
       }).format(n);
+    }
+
+    function getLatestCount(item, baseKey) {
+      const updatedKey = `updated_${baseKey}`;
+      const updatedValue = item ? item[updatedKey] : "";
+      if (updatedValue !== null && updatedValue !== undefined && String(updatedValue).trim() !== "") {
+        return updatedValue;
+      }
+      return item ? item[baseKey] : "";
     }
 
     async function startRun() {
@@ -488,20 +526,21 @@
       if (!item) {
         return `<div class="sample"><strong>${esc(title)}</strong><div class="muted" style="margin-top:6px;">Not captured in this run.</div></div>`;
       }
-      const viewsRow = isReel ? `<tr><th>Views</th><td>${esc(item.views_count)}</td></tr>` : "";
+      const viewsRow = isReel ? `<tr><th>Views</th><td>${esc(getLatestCount(item, "views_count") || "")}</td></tr>` : "";
       return `
         <div class="sample">
           <strong>${esc(title)}</strong>
           <table>
             <tr><th>Post URL</th><td><a href="${esc(item.post_url)}" target="_blank" rel="noopener noreferrer">${esc(item.post_url)}</a></td></tr>
             <tr><th>Media Type</th><td>${esc(item.media_type)}</td></tr>
-            <tr><th>Likes</th><td>${esc(item.likes_count)}</td></tr>
-            <tr><th>Comments</th><td>${esc(item.comments_count)}</td></tr>
+            <tr><th>Likes</th><td>${esc(getLatestCount(item, "likes_count") || "")}</td></tr>
+            <tr><th>Comments</th><td>${esc(getLatestCount(item, "comments_count") || "")}</td></tr>
             ${viewsRow}
-            <tr><th>Reposts</th><td>${esc(item.repost_count || "")}</td></tr>
+            <tr><th>Reposts</th><td>${esc(getLatestCount(item, "repost_count") || "")}</td></tr>
             <tr><th>Hashtags</th><td>${esc(item.hashtags_csv || "")}</td></tr>
             <tr><th>Keywords</th><td>${esc(item.keywords_csv || "")}</td></tr>
             <tr><th>Mentions</th><td>${esc(item.mentions_csv || "")}</td></tr>
+            <tr><th>Collaborators</th><td>${esc(item.collaborators_csv || "")}</td></tr>
           </table>
           <div class="small">Remote media URLs:</div>
           ${linkList(item.media_asset_urls || [])}
@@ -564,7 +603,7 @@
         item.sample_bucket ? `<span class='pill'>${esc(item.sample_bucket)}</span>` : "",
       ].join("");
 
-      const viewsRow = isReel ? `<tr><th>Views</th><td>${esc(item.views_count || "")}</td></tr>` : "";
+      const viewsRow = isReel ? `<tr><th>Views</th><td>${esc(getLatestCount(item, "views_count") || "")}</td></tr>` : "";
 
       return `
         <div class='output-card'>
@@ -572,14 +611,15 @@
           <div style='margin-top:6px;'><a href='${esc(item.post_url || "")}' target='_blank' rel='noopener noreferrer'>${esc(item.post_url || "")}</a></div>
           ${renderPreview(previewUrl)}
           <table>
-            <tr><th>Likes</th><td>${esc(item.likes_count || "")}</td></tr>
-            <tr><th>Comments</th><td>${esc(item.comments_count || "")}</td></tr>
+            <tr><th>Likes</th><td>${esc(getLatestCount(item, "likes_count") || "")}</td></tr>
+            <tr><th>Comments</th><td>${esc(getLatestCount(item, "comments_count") || "")}</td></tr>
             ${viewsRow}
-            <tr><th>Reposts</th><td>${esc(item.repost_count || "")}</td></tr>
+            <tr><th>Reposts</th><td>${esc(getLatestCount(item, "repost_count") || "")}</td></tr>
             <tr><th>Tagged Users</th><td>${esc(item.tagged_users_count || "")}</td></tr>
             <tr><th>Hashtags</th><td>${esc(item.hashtags_csv || "")}</td></tr>
             <tr><th>Keywords</th><td>${esc(item.keywords_csv || "")}</td></tr>
             <tr><th>Mentions</th><td>${esc(item.mentions_csv || "")}</td></tr>
+            <tr><th>Collaborators</th><td>${esc(item.collaborators_csv || "")}</td></tr>
             <tr><th>Location</th><td>${esc(item.location_name || "")}</td></tr>
             <tr><th>Posted At</th><td>${esc(item.posted_at_ist || "")}</td></tr>
             <tr><th>Caption</th><td>${esc(item.caption_text || "")}</td></tr>
@@ -592,46 +632,171 @@
 
     function renderMixedTable(mixedRows, posts, reels, total) {
       const limited = mixedRows.slice(0, 50);
+      const columns = [
+        { key: "_index", label: "#" },
+        { key: "content_type", label: "Type" },
+        { key: "media_type", label: "Media Type" },
+        { key: "shortcode", label: "Shortcode" },
+        { key: "post_url", label: "URL", isLink: true },
+        { key: "posted_at_ist", label: "Posted At (IST)" },
+        { key: "likes_count", label: "Likes", useLatest: true },
+        { key: "comments_count", label: "Comments", useLatest: true },
+        { key: "views_count", label: "Views", useLatest: true },
+        { key: "repost_count", label: "Reposts", useLatest: true },
+        { key: "updated_likes_count", label: "Updated Likes" },
+        { key: "updated_comments_count", label: "Updated Comments" },
+        { key: "updated_views_count", label: "Updated Views" },
+        { key: "updated_repost_count", label: "Updated Reposts" },
+        { key: "sync_checked_at_ist", label: "Sync Checked At" },
+        { key: "tagged_users_count", label: "Tagged Users" },
+        { key: "hashtags_csv", label: "Hashtags" },
+        { key: "keywords_csv", label: "Keywords" },
+        { key: "mentions_csv", label: "Mentions" },
+        { key: "collaborators_csv", label: "Collaborators" },
+        { key: "caption_text", label: "Caption" },
+        { key: "location_name", label: "Location" },
+        { key: "sample_bucket", label: "Sample Bucket" },
+        { key: "missing_reason_post", label: "Missing Reason" }
+      ];
+
       const body = limited.map((item, idx) => {
-        const type = item.content_type || (String(item.media_type || "").toLowerCase() === "reel" ? "reel" : "post");
-        return `
-          <tr>
-            <td>${idx + 1}</td>
-            <td>${esc(type)}</td>
-            <td>${esc(item.media_type || "")}</td>
-            <td>${esc(item.shortcode || "")}</td>
-            <td>${item.post_url ? `<a href='${esc(item.post_url)}' target='_blank' rel='noopener noreferrer'>open</a>` : ""}</td>
-            <td>${esc(item.likes_count || "")}</td>
-            <td>${esc(item.comments_count || "")}</td>
-            <td>${esc(item.views_count || "")}</td>
-            <td>${esc(item.repost_count || "")}</td>
-            <td>${esc(item.posted_at_ist || "")}</td>
-          </tr>
-        `;
+        const normalizedType = item.content_type || (String(item.media_type || "").toLowerCase() === "reel" ? "reel" : "post");
+        const cells = columns.map(col => {
+          if (col.key === "_index") {
+            return `<td>${idx + 1}</td>`;
+          }
+
+          let value = "";
+          if (col.key === "content_type") {
+            value = normalizedType;
+          } else if (col.useLatest) {
+            value = getLatestCount(item, col.key);
+          } else {
+            value = item[col.key];
+          }
+
+          if (col.isLink) {
+            return `<td>${value ? `<a href='${esc(value)}' target='_blank' rel='noopener noreferrer'>open</a>` : ""}</td>`;
+          }
+
+          return `<td>${esc(value || "")}</td>`;
+        }).join("");
+
+        return `<tr>${cells}</tr>`;
       }).join("");
+
+      const head = columns.map(col => `<th>${esc(col.label)}</th>`).join("");
 
       outputBox.innerHTML = `
         <div class='small'>Total outputs: ${esc(total)} | Posts: ${esc(posts.length)} | Reels: ${esc(reels.length)} | Showing: ${esc(limited.length)} rows (max 50)</div>
         <div class='table-scroll' style='margin-top:8px;'>
           <table class='data-table'>
             <thead>
-              <tr>
-                <th>#</th>
-                <th>Type</th>
-                <th>Media Type</th>
-                <th>Shortcode</th>
-                <th>URL</th>
-                <th>Likes</th>
-                <th>Comments</th>
-                <th>Views</th>
-                <th>Reposts</th>
-                <th>Posted At (IST)</th>
-              </tr>
+              <tr>${head}</tr>
             </thead>
-            <tbody>${body || "<tr><td colspan='10' class='muted'>No rows.</td></tr>"}</tbody>
+            <tbody>${body || `<tr><td colspan='${columns.length}' class='muted'>No rows.</td></tr>`}</tbody>
           </table>
         </div>
       `;
+    }
+
+    function renderSyncResult(data) {
+      const preview = Array.isArray(data.preview_rows) ? data.preview_rows : [];
+      const syncCsv = data.synced_csv_output_url || data.synced_csv || "";
+      const sourceCsv = data.source_csv_output_url || data.source_csv || "";
+
+      const rows = preview.map((row, idx) => `
+        <tr>
+          <td>${idx + 1}</td>
+          <td>${row.post_url ? `<a href='${esc(row.post_url)}' target='_blank' rel='noopener noreferrer'>open</a>` : ""}</td>
+          <td>${esc(row.updated_likes_count || "")}</td>
+          <td>${esc(row.updated_comments_count || "")}</td>
+          <td>${esc(row.updated_views_count || "")}</td>
+          <td>${esc(row.updated_repost_count || "")}</td>
+          <td>${esc(row.likes_count || "")}</td>
+          <td>${esc(row.comments_count || "")}</td>
+          <td>${esc(row.views_count || "")}</td>
+          <td>${esc(row.repost_count || "")}</td>
+        </tr>
+      `).join("");
+
+      syncResultBox.innerHTML = `
+        <div class='small'>Targeted reels: ${esc(data.reels_targeted)} | Updated: ${esc(data.reels_updated)} | Failed: ${esc(data.failed_count)}</div>
+        <div class='small' style='margin-top:6px;'>Source CSV: ${sourceCsv ? `<a href='${esc(sourceCsv)}' target='_blank' rel='noopener noreferrer'>open</a>` : "n/a"}</div>
+        <div class='small' style='margin-top:4px;'>Synced CSV: ${syncCsv ? `<a href='${esc(syncCsv)}' target='_blank' rel='noopener noreferrer'>open</a>` : "n/a"}</div>
+        <div class='table-scroll' style='margin-top:8px;'>
+          <table class='data-table'>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Reel URL</th>
+                <th>Updated Likes</th>
+                <th>Updated Comments</th>
+                <th>Updated Views</th>
+                <th>Updated Reposts</th>
+                <th>Old Likes</th>
+                <th>Old Comments</th>
+                <th>Old Views</th>
+                <th>Old Reposts</th>
+              </tr>
+            </thead>
+            <tbody>${rows || "<tr><td colspan='10' class='muted'>No preview rows.</td></tr>"}</tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    async function syncReelCounts() {
+      const url = (urlInput.value || "").trim();
+      if (!url) {
+        alert("Enter a profile URL first.");
+        return;
+      }
+
+      const selectedFile = syncCsvFileInput && syncCsvFileInput.files && syncCsvFileInput.files.length
+        ? syncCsvFileInput.files[0]
+        : null;
+      const sourceCsvPath = String(syncCsvPathInput?.value || "").trim();
+      const maxRaw = String(syncMaxReelsInput?.value || "").trim();
+      const parsedMax = Number(maxRaw);
+      const maxReels = Number.isFinite(parsedMax) && parsedMax > 0 ? Math.floor(parsedMax) : null;
+
+      syncBtn.disabled = true;
+      syncStatusText.textContent = selectedFile
+        ? `Sync in progress using uploaded CSV (${selectedFile.name}).`
+        : "Sync in progress. Opening existing reel URLs and fetching latest counts...";
+      syncResultBox.innerHTML = "";
+
+      try {
+        let sourceCsvText = null;
+        let sourceCsvFilename = null;
+        if (selectedFile) {
+          sourceCsvText = await selectedFile.text();
+          sourceCsvFilename = selectedFile.name || null;
+        }
+
+        const resp = await fetch("/v1/reels/sync-counts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            profile_url: url,
+            source_csv_path: sourceCsvPath || null,
+            source_csv_filename: sourceCsvFilename,
+            source_csv_text: sourceCsvText,
+            use_saved_session: true,
+            max_reels: maxReels
+          })
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || "Failed to sync reel counts");
+
+        syncStatusText.textContent = `Sync completed for ${data.reels_updated}/${data.reels_targeted} reels.`;
+        renderSyncResult(data);
+      } catch (err) {
+        syncStatusText.textContent = String(err.message || err);
+      } finally {
+        syncBtn.disabled = false;
+      }
     }
 
     function renderOutputCards(posts, reels, total) {
@@ -701,6 +866,7 @@
     settingsStartTabBtn.addEventListener("click", () => setStartTab("settings"));
     mixedTabBtn.addEventListener("click", () => setOutputTab("mixed"));
     cardsTabBtn.addEventListener("click", () => setOutputTab("cards"));
+    syncBtn.addEventListener("click", syncReelCounts);
   </script>
 </body>
 </html>

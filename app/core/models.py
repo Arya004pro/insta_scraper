@@ -103,6 +103,7 @@ POSTS_COLUMNS = [
     "hashtags_csv",
     "keywords_csv",
     "mentions_csv",
+    "collaborators_csv",
     "caption_text",
     "location_name",
     "media_asset_urls_csv",
@@ -165,6 +166,45 @@ class StartRunRequest(BaseModel):
     @classmethod
     def strip_value(cls, value: str) -> str:
         return value.strip()
+
+
+class SyncReelsCountsRequest(BaseModel):
+    profile_url: str = Field(min_length=1)
+    source_csv_path: str | None = None
+    source_csv_filename: str | None = None
+    source_csv_text: str | None = None
+    use_saved_session: bool = True
+    max_reels: int | None = Field(default=None, ge=1, le=5000)
+
+    @field_validator("profile_url")
+    @classmethod
+    def strip_profile_url(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("source_csv_path")
+    @classmethod
+    def strip_source_csv_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
+    @field_validator("source_csv_filename")
+    @classmethod
+    def strip_source_csv_filename(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
+    @field_validator("source_csv_text")
+    @classmethod
+    def validate_source_csv_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.strip():
+            return None
+        return value
 
 
 class RunStatusResponse(BaseModel):
@@ -230,6 +270,7 @@ class PostRecord(BaseModel):
     hashtags_csv: str | None = None
     keywords_csv: str | None = None
     mentions_csv: str | None = None
+    collaborators_csv: str | None = None
     caption_text: str | None = None
     location_name: str | None = None
     media_asset_urls_csv: str | None = None

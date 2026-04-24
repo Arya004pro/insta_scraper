@@ -2891,6 +2891,272 @@ class RunOrchestrator:
         self.store.add_event(run_id, f"Challenge detected ({pattern})", level="warning")
         raise ChallengeRequired("Instagram challenge/login wall detected", state=state)
 
+    def _resolve_sync_source_csv(
+        self, username: str, source_csv_path: str | None
+    ) -> Path:
+        if source_csv_path:
+            candidate = Path(source_csv_path).expanduser().resolve()
+            if not candidate.exists() or not candidate.is_file():
+                raise FileNotFoundError(f"Source CSV not found: {candidate}")
+            return candidate
+
+        safe_username = "".join(
+            ch if ch.isalnum() or ch in {"_", "-", "."} else "_"
+            for ch in (username or "").strip().lower()
+        ).strip("_")
+        if not safe_username:
+            raise ValueError("Could not derive username from profile URL")
+
+        ranked: list[Path] = []
+        for pattern in (
+            f"**/instagram_{safe_username}_content_latest.csv",
+            f"**/instagram_{safe_username}_content_latest_synced.csv",
+        ):
+            ranked.extend(self.settings.media_dir.glob(pattern))
+
+        ranked = sorted(
+            [p for p in ranked if p.exists() and p.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not ranked:
+            raise FileNotFoundError(
+                f"No existing content CSV found for username '{safe_username}' under {self.settings.media_dir}"
+            )
+        return ranked[0]
+
+    def sync_existing_reels_counts(
+        self,
+        profile_url: str,
+        source_csv_path: str | None = None,
+        use_saved_session: bool = True,
+        max_reels: int | None = None,
+    ) -> dict[str, Any]:
+        normalized = normalize_instagram_profile_url(profile_url).normalized_url
+        username_hint = normalized.rstrip("/").split("/")[-1]
+        source_csv = self._resolve_sync_source_csv(username_hint, source_csv_path)
+
+        with source_csv.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            existing_columns = list(reader.fieldnames or [])
+            rows = [{k: (v or "") for k, v in row.items()} for row in reader]
+
+        if not rows:
+            raise ValueError(f"Source CSV has no rows: {source_csv}")
+
+        def _is_reel_row(row: dict[str, str]) -> bool:
+            content_type = (row.get("content_type") or "").strip().lower()
+            media_type = (row.get("media_type") or "").strip().lower()
+            post_url = (row.get("post_url") or "").strip().lower()
+            return (
+                content_type == "reel" or media_type == "reel" or "/reel/" in post_url
+            )
+
+        reel_indices = [idx for idx, row in enumerate(rows) if _is_reel_row(row)]
+        if not reel_indices:
+            raise ValueError("No reel rows found in source CSV")
+
+        if isinstance(max_reels, int) and max_reels > 0:
+            reel_indices = reel_indices[:max_reels]
+
+        run_id = f"sync_{uuid.uuid4().hex}"
+        proxy_manager = ProxyManager(self.settings)
+        playwright, context, temp_profile_dir = self._launch_context(
+            run_id=run_id,
+            proxy_manager=proxy_manager,
+            use_saved_session=use_saved_session,
+            username_hint=username_hint,
+        )
+
+        def _as_int_or_none(value: Any) -> int | None:
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.strip():
+                raw = value.strip().replace(",", "")
+                try:
+                    return int(float(raw))
+                except Exception:
+                    return None
+            return None
+
+        updated = 0
+        failures: list[dict[str, str]] = []
+        sync_checked_at = iso_ist(now_ist())
+        effective_post_detail_wait_ms = min(
+            max(self.settings.post_detail_wait_ms, 120), 220
+        )
+        effective_post_detail_nav_timeout_ms = min(
+            max(int(os.getenv("POST_DETAIL_NAV_TIMEOUT_MS", "12000")), 7000),
+            20_000,
+        )
+
+        try:
+            pages = [p for p in (context.pages or []) if not p.is_closed()]
+            page = pages[0] if pages else context.new_page()
+
+            for idx in reel_indices:
+                row = rows[idx]
+                post_url = (row.get("post_url") or "").strip()
+                if not post_url:
+                    failures.append(
+                        {"row_index": str(idx + 1), "error": "missing_post_url"}
+                    )
+                    continue
+
+                try:
+                    detail = scrape_post_detail(
+                        page,
+                        post_url,
+                        media_type_hint="reel",
+                        page_settle_ms=effective_post_detail_wait_ms,
+                        navigation_timeout_ms=effective_post_detail_nav_timeout_ms,
+                    )
+
+                    old_likes = _as_int_or_none(row.get("likes_count"))
+                    old_comments = _as_int_or_none(row.get("comments_count"))
+                    old_views = _as_int_or_none(row.get("views_count"))
+                    old_reposts = _as_int_or_none(row.get("repost_count"))
+
+                    likes = detail.get("likes_count")
+                    comments = detail.get("comments_count")
+                    views = detail.get("views_count")
+                    reposts = detail.get("repost_count")
+
+                    row["updated_likes_count"] = (
+                        str(likes)
+                        if isinstance(likes, int)
+                        else str(old_likes)
+                        if old_likes is not None
+                        else ""
+                    )
+                    row["updated_comments_count"] = (
+                        str(comments)
+                        if isinstance(comments, int)
+                        else str(old_comments)
+                        if old_comments is not None
+                        else ""
+                    )
+                    row["updated_views_count"] = (
+                        str(views)
+                        if isinstance(views, int)
+                        else str(old_views)
+                        if old_views is not None
+                        else ""
+                    )
+                    row["updated_repost_count"] = (
+                        str(reposts)
+                        if isinstance(reposts, int)
+                        else str(old_reposts)
+                        if old_reposts is not None
+                        else ""
+                    )
+                    row["sync_checked_at_ist"] = sync_checked_at
+
+                    if detail.get("posted_at_ist"):
+                        row["posted_at_ist"] = str(detail.get("posted_at_ist") or "")
+                    for key in (
+                        "caption_text",
+                        "hashtags_csv",
+                        "keywords_csv",
+                        "mentions_csv",
+                        "collaborators_csv",
+                        "location_name",
+                    ):
+                        value = detail.get(key)
+                        if isinstance(value, str) and value.strip():
+                            row[key] = value.strip()
+
+                    updated += 1
+                except Exception as exc:
+                    row["sync_checked_at_ist"] = sync_checked_at
+                    failures.append(
+                        {
+                            "row_index": str(idx + 1),
+                            "post_url": post_url,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+            if temp_profile_dir:
+                shutil.rmtree(temp_profile_dir, ignore_errors=True)
+
+        legacy_count_columns = [
+            "likes_count",
+            "comments_count",
+            "views_count",
+            "repost_count",
+        ]
+        updated_count_columns = [
+            "updated_likes_count",
+            "updated_comments_count",
+            "updated_views_count",
+            "updated_repost_count",
+            "sync_checked_at_ist",
+        ]
+
+        ordered_base_columns = [
+            col
+            for col in existing_columns
+            if col not in set(legacy_count_columns + updated_count_columns)
+        ]
+
+        output_columns = (
+            ordered_base_columns + updated_count_columns + legacy_count_columns
+        )
+        for row in rows:
+            for col in output_columns:
+                row.setdefault(col, "")
+
+        if source_csv.stem.endswith("_synced"):
+            synced_csv = source_csv
+        else:
+            synced_csv = source_csv.with_name(
+                f"{source_csv.stem}_synced{source_csv.suffix}"
+            )
+
+        with synced_csv.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=output_columns, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({col: row.get(col, "") for col in output_columns})
+
+        preview_rows = []
+        for idx in reel_indices:
+            row = rows[idx]
+            preview_rows.append(
+                {
+                    "post_url": row.get("post_url") or "",
+                    "updated_likes_count": row.get("updated_likes_count") or "",
+                    "updated_comments_count": row.get("updated_comments_count") or "",
+                    "updated_views_count": row.get("updated_views_count") or "",
+                    "updated_repost_count": row.get("updated_repost_count") or "",
+                    "likes_count": row.get("likes_count") or "",
+                    "comments_count": row.get("comments_count") or "",
+                    "views_count": row.get("views_count") or "",
+                    "repost_count": row.get("repost_count") or "",
+                }
+            )
+
+        return {
+            "profile_url": normalized,
+            "username": username_hint,
+            "source_csv": str(source_csv.resolve()),
+            "synced_csv": str(synced_csv.resolve()),
+            "reels_targeted": len(reel_indices),
+            "reels_updated": updated,
+            "failed_count": len(failures),
+            "failures": failures,
+            "preview_rows": preview_rows,
+        }
+
     def _export(
         self,
         run_id: str,

@@ -30,6 +30,7 @@ PROFILE_CONTENT_COLUMNS = [
     "hashtags_csv",
     "keywords_csv",
     "mentions_csv",
+    "collaborators_csv",
     "caption_text",
     "location_name",
     "media_asset_urls_csv",

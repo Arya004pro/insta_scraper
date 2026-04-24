@@ -339,6 +339,34 @@ def _extract_repost_count_from_json_payload(page: object, shortcode: str) -> int
     return None
 
 
+def _extract_collaborators_from_json_payload(
+    page: object, shortcode: str
+) -> str | None:
+    blocks: list[str] = []
+    for scope in _shortcode_scopes(page, shortcode):
+        for pattern in (
+            r'"coauthor_producers"\s*:\s*\[(.*?)\]',
+            r'"invited_coauthor_producers"\s*:\s*\[(.*?)\]',
+            r'"collaborator_users"\s*:\s*\[(.*?)\]',
+        ):
+            blocks.extend(
+                m.group(1)
+                for m in re.finditer(pattern, scope, flags=re.DOTALL)
+                if m and m.group(1)
+            )
+
+    usernames: set[str] = set()
+    for block in blocks:
+        for match in re.finditer(r'"username"\s*:\s*"((?:\\.|[^"\\])*)"', block):
+            value = (_json_unescape(match.group(1)) or "").strip()
+            if value:
+                usernames.add(value.lower())
+
+    if not usernames:
+        return None
+    return ",".join(sorted(usernames))
+
+
 def _extract_caption(page: object) -> str | None:
     selectors = ["article h1", "main h1", "article ul li h1"]
     for selector in selectors:
@@ -670,6 +698,8 @@ def scrape_post_detail(
     if repost_count is None:
         repost_count = _extract_repost_count_from_json_payload(page, shortcode)
 
+    collaborators_csv = _extract_collaborators_from_json_payload(page, shortcode)
+
     hashtags = HASHTAG_RE.findall(caption or "")
     mentions = MENTION_RE.findall(caption or "")
     is_remix = bool(re.search(r"\bremix\b|\brepost\b", (caption or ""), re.IGNORECASE))
@@ -700,6 +730,7 @@ def scrape_post_detail(
         "hashtags_csv": ",".join(sorted(set(hashtags))) if hashtags else None,
         "keywords_csv": _extract_keywords(caption),
         "mentions_csv": ",".join(sorted(set(mentions))) if mentions else None,
+        "collaborators_csv": collaborators_csv,
         "caption_text": caption,
         "location_name": location_name,
         "media_asset_urls": media_asset_urls,
