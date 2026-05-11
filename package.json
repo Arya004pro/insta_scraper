@@ -1,0 +1,12 @@
+{
+  "name": "insta-scraper",
+  "private": true,
+  "scripts": {
+    "prestart": "npm run stop && cmd /c scripts\\vpn\\open_opera_scraper.bat",
+    "dev": ".\\.venv\\Scripts\\python.exe -m app.dev_server",
+    "start": ".\\.venv\\Scripts\\python.exe -m app.dev_server",
+    "open-scraper-browser": "scripts\\vpn\\open_opera_scraper.bat",
+    "stop": "powershell -NoProfile -Command \"$lines = @(netstat -ano | findstr LISTENING | findstr :8000); $pids = @(); foreach ($line in $lines) { $parts = $line.Trim().Split() | Where-Object { $_ -ne '' }; if ($parts.Count -gt 0) { $pidRaw = $parts[$parts.Count - 1]; if ($pidRaw -match '^[0-9]+$') { $pids += [int]$pidRaw } } }; $pids = @($pids | Select-Object -Unique); if ($pids.Count -gt 0) { $pids | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue; Write-Output ('Stopped PID ' + $_) } } else { Write-Output 'No process listening on port 8000' }\"",
+    "status": "powershell -NoProfile -Command \"$lines = @(netstat -ano | findstr LISTENING | findstr :8000); if ($lines.Count -gt 0) { Write-Output 'UP'; $lines } else { Write-Output 'DOWN' }\""
+  }
+}

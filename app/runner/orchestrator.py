@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import random
+import shlex
 
 import re
 import shutil
@@ -22,7 +23,11 @@ from urllib.parse import urlparse
 import requests
 
 
-from app.anti_block.challenge_handler import collect_page_diagnostics, detect_challenge
+from app.anti_block.challenge_handler import (
+    collect_page_diagnostics,
+    detect_account_restriction,
+    detect_challenge,
+)
 from app.anti_block.proxy_manager import ProxyManager
 from app.anti_block.session_manager import SessionManager
 from app.collectors.about_scraper import scrape_about_section
@@ -56,6 +61,18 @@ class ChallengeRequired(Exception):
     def __init__(self, message: str, state: dict[str, Any] | None = None):
         super().__init__(message)
         self.state = state or {}
+
+
+class ManualStepRequired(Exception):
+    def __init__(
+        self,
+        message: str,
+        state: dict[str, Any] | None = None,
+        error_code: str = "manual_step_required",
+    ) -> None:
+        super().__init__(message)
+        self.state = state or {}
+        self.error_code = error_code
 
 
 class RunCancelled(Exception):
@@ -200,6 +217,107 @@ class RunOrchestrator:
             time.sleep(step)
             remaining -= step
 
+    def _run_vpn_rotate_command(self, run_id: str) -> bool:
+        command = (self.settings.vpn_rotate_command or "").strip()
+        if not command:
+            return False
+        self.store.add_event(run_id, f"Executing VPN rotate command: {command}")
+        try:
+            args = shlex.split(command, posix=False)
+            result = subprocess.run(
+                args,
+                shell=False,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as exc:
+            self.store.add_event(run_id, f"VPN rotate shell=False start failed: {exc}", level="warning")
+            try:
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except Exception as exc2:
+                self.store.add_event(
+                    run_id,
+                    f"VPN rotate command failed to start: {exc2}",
+                    level="warning",
+                )
+                return False
+
+        def _trim(value: str | None, limit: int = 300) -> str | None:
+            if not value:
+                return None
+            text = value.strip()
+            if len(text) <= limit:
+                return text
+            return text[:limit] + "..."
+
+        stdout = _trim(result.stdout)
+        stderr = _trim(result.stderr)
+        if stdout:
+            self.store.add_event(run_id, f"VPN rotate stdout: {stdout}")
+        if stderr:
+            self.store.add_event(
+                run_id, f"VPN rotate stderr: {stderr}", level="warning"
+            )
+
+        if result.returncode != 0:
+            self.store.add_event(
+                run_id,
+                f"VPN rotate command failed (exit {result.returncode}).",
+                level="warning",
+            )
+            return False
+
+        self.store.add_event(run_id, "VPN rotate command completed successfully.")
+        return True
+
+    def shutdown(self, join_timeout_seconds: float = 5.0) -> None:
+        with self._thread_lock:
+            run_ids = list(self._threads.keys())
+            threads = dict(self._threads)
+            flags = dict(self._stop_flags)
+
+        for run_id in run_ids:
+            flag = flags.get(run_id)
+            if flag is not None:
+                flag.set()
+            run = self.store.get_run(run_id)
+            if run and run.status not in {
+                "completed",
+                "failed",
+                "skipped_private",
+                "needs_human",
+                "cancelled",
+            }:
+                self.store.update_run(
+                    run_id,
+                    status="cancelling",
+                    error_code="server_shutdown",
+                    error_message="Server shutdown requested. Cancelling run.",
+                    progress_message="Stopping due to server shutdown",
+                )
+            self.store.add_event(
+                run_id, "Server shutdown requested; stopping run thread.", level="warning"
+            )
+
+        deadline = time.time() + max(0.0, join_timeout_seconds)
+        for run_id, thread in threads.items():
+            if not thread.is_alive():
+                continue
+            remaining = max(0.0, deadline - time.time())
+            if remaining <= 0:
+                break
+            try:
+                thread.join(timeout=remaining)
+            except Exception:
+                pass
+
     def _cleanup_run_tracking(self, run_id: str) -> None:
         with self._thread_lock:
             self._threads.pop(run_id, None)
@@ -316,6 +434,21 @@ class RunOrchestrator:
                 progress_message="Run cancelled by operator",
             )
             self.store.add_event(run_id, "Run cancelled by operator.", level="warning")
+        except ManualStepRequired as manual:
+            run = self.store.get_run(run_id)
+            state = run.state if run else {}
+            state.update({"profile_state": manual.state})
+            self.store.update_run(
+                run_id,
+                status="needs_human",
+                challenge_encountered=False,
+                error_code=manual.error_code,
+                error_message=str(manual),
+                state=state,
+            )
+            self.store.add_event(
+                run_id, "Run paused for manual action", level="warning"
+            )
         except ChallengeRequired as challenge:
             run = self.store.get_run(run_id)
             state = run.state if run else {}
@@ -358,7 +491,19 @@ class RunOrchestrator:
                     level="warning",
                 )
             else:
-                self.store.fail_run(run_id, "run_error", str(exc))
+                if self._is_closed_context_error(exc):
+                    self.store.add_event(
+                        run_id,
+                        "Browser context closed during run. This usually means the scraper Opera window was closed manually.",
+                        level="warning",
+                    )
+                    self.store.fail_run(
+                        run_id,
+                        "browser_closed",
+                        "Browser window/context was closed while scraping.",
+                    )
+                else:
+                    self.store.fail_run(run_id, "run_error", str(exc))
         finally:
             self._cleanup_run_tracking(run_id)
 
@@ -393,10 +538,10 @@ class RunOrchestrator:
             raise ValueError("Only CSV batch input is supported in v1")
         return urls
 
-    def _is_camoufox_running(self) -> bool:
-        executable_name = "camoufox.exe" if os.name == "nt" else "camoufox"
-        if self.settings.camoufox_executable_path:
-            executable_name = Path(self.settings.camoufox_executable_path).name
+    def _is_opera_gx_running(self) -> bool:
+        executable_name = "opera.exe" if os.name == "nt" else "opera"
+        if self.settings.opera_gx_executable_path:
+            executable_name = Path(self.settings.opera_gx_executable_path).name
 
         try:
             if os.name == "nt":
@@ -409,17 +554,16 @@ class RunOrchestrator:
                 if executable_name.lower() in result.stdout.lower():
                     return True
 
-                # Camoufox may run as firefox.exe depending on platform package.
                 fallback = subprocess.run(
-                    ["tasklist", "/FI", "IMAGENAME eq firefox.exe"],
+                    ["tasklist", "/FI", "IMAGENAME eq opera.exe"],
                     capture_output=True,
                     text=True,
                     check=False,
                 )
-                return "firefox.exe" in fallback.stdout.lower()
+                return "opera.exe" in fallback.stdout.lower()
 
             result = subprocess.run(
-                ["pgrep", "-f", "camoufox|firefox"],
+                ["pgrep", "-f", "opera|opera-gx|opera_gx"],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -428,12 +572,12 @@ class RunOrchestrator:
         except Exception:
             return False
 
-    def _clone_camoufox_profile_snapshot(
+    def _clone_opera_gx_profile_snapshot(
         self, run_id: str, source_user_data_dir: Path
     ) -> Path:
         clone_root = (
             self.settings.browser_state_dir
-            / "camoufox_profile_clones"
+            / "opera_gx_profile_clones"
             / f"{run_id[:8]}_{int(time.time())}"
         )
         clone_dir = clone_root / "profile"
@@ -441,23 +585,27 @@ class RunOrchestrator:
 
         if not source_user_data_dir.exists():
             raise RuntimeError(
-                f"Camoufox user data directory not found: {source_user_data_dir}"
+                f"Opera GX user data directory not found: {source_user_data_dir}"
             )
 
         ignore_names = {
-            "cache2",
-            "startupCache",
-            "shader-cache",
-            "jumpListCache",
-            "minidumps",
-            "crashes",
-            "OfflineCache",
-            "thumbnails",
-            "sessionstore-backups",
-            "sessionstore.jsonlz4",
-            "previous.jsonlz4",
-            "recovery.jsonlz4",
-            "recovery.baklz4",
+            "Cache",
+            "Code Cache",
+            "GPUCache",
+            "ShaderCache",
+            "GrShaderCache",
+            "Crashpad",
+            "Crash Reports",
+            "Media Cache",
+            "DawnCache",
+            "OptimizationGuidePredictionModels",
+            # Avoid restoring old browsing sessions/tabs in the cloned profile.
+            "Sessions",
+            "Current Session",
+            "Current Tabs",
+            "Last Session",
+            "Last Tabs",
+            "Tabs",
         }
 
         def _ignore(_: str, names: list[str]) -> set[str]:
@@ -543,72 +691,189 @@ class RunOrchestrator:
     ) -> tuple[Any, Any, Path | None]:
         from playwright.sync_api import sync_playwright
 
-        if not self.settings.camoufox_executable_path:
+        if not self.settings.opera_gx_executable_path:
             raise RuntimeError(
-                "Camoufox mode requires CAMOUFOX_EXECUTABLE_PATH or an installed camoufox package."
+                "Opera GX mode requires OPERA_GX_EXECUTABLE_PATH or an installed Opera GX browser."
             )
 
-        source_user_data_dir = Path(self.settings.camoufox_user_data_dir or "")
+        source_user_data_dir = Path(self.settings.opera_gx_user_data_dir or "")
         source_user_data_dir.mkdir(parents=True, exist_ok=True)
 
         playwright = sync_playwright().start()
         proxy = proxy_manager.active
         temp_profile_dir: Path | None = None
         effective_user_data_dir = source_user_data_dir
+        opera_running = self._is_opera_gx_running()
 
-        camoufox_running = self._is_camoufox_running()
-        if camoufox_running and not self.settings.camoufox_clone_profile_when_running:
-            raise RuntimeError(
-                "Camoufox appears to be running. Close it and retry, or enable CAMOUFOX_CLONE_PROFILE_WHEN_RUNNING=1"
-            )
+        if self.settings.opera_gx_attach_existing:
+            endpoint = self.settings.opera_gx_cdp_url
+            if not endpoint:
+                if opera_running:
+                    try:
+                        playwright.stop()
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        "Opera GX is running, but OPERA_GX_CDP_URL is empty. Start scraper Opera with scripts/vpn/open_opera_scraper.bat or set OPERA_GX_CDP_URL."
+                    )
+            else:
+                cdp_ready = False
+                cdp_probe_error = ""
+                probe_url = endpoint.rstrip("/") + "/json/version"
+                probe_attempts = 20 if opera_running else 8
+                for _ in range(probe_attempts):
+                    try:
+                        requests.get(
+                            probe_url,
+                            timeout=min(5, self.settings.request_timeout_seconds),
+                        ).raise_for_status()
+                        cdp_ready = True
+                        break
+                    except Exception as exc:
+                        cdp_probe_error = f"{type(exc).__name__}: {exc}"
+                        self._sleep_interruptible(run_id, 1.0)
 
-        try:
-            self.store.add_event(
-                run_id,
-                "Creating isolated browser profile snapshot for unattended scraping session.",
+                if cdp_ready:
+                    attach_error = ""
+                    for connect_timeout in (10_000, 20_000, 30_000):
+                        browser = None
+                        try:
+                            browser = playwright.chromium.connect_over_cdp(
+                                endpoint_url=endpoint,
+                                timeout=connect_timeout,
+                            )
+                            contexts: list[Any] = []
+                            for _ in range(20):
+                                contexts = list(browser.contexts)
+                                if contexts:
+                                    break
+                                self._sleep_interruptible(run_id, 0.25)
+                            if not contexts:
+                                raise RuntimeError(
+                                    "Connected to CDP but no browser context was exposed."
+                                )
+                            context = contexts[0]
+                            context.set_default_timeout(15_000)
+                            if use_saved_session:
+                                self._apply_saved_storage_state(
+                                    run_id, context, username_hint
+                                )
+                            self.store.add_event(
+                                run_id,
+                                f"Attached to running Opera GX via CDP ({endpoint}).",
+                            )
+                            return playwright, context, temp_profile_dir
+                        except Exception as exc:
+                            attach_error = f"{type(exc).__name__}: {exc}"
+                            try:
+                                if browser:
+                                    browser.close()
+                            except Exception:
+                                pass
+                            self._sleep_interruptible(run_id, 1.0)
+
+                    if opera_running:
+                        try:
+                            playwright.stop()
+                        except Exception:
+                            pass
+                        raise RuntimeError(
+                            "Opera GX is running and CDP endpoint responded, but attach failed after retries. "
+                            "Close only the scraper Opera window and re-run npm start. "
+                            f"Last cause: {attach_error}"
+                        )
+
+                    self.store.add_event(
+                        run_id,
+                        "CDP attach failed after retries; falling back to dedicated scraper instance. "
+                        f"Last cause: {attach_error}",
+                        level="warning",
+                    )
+                else:
+                    if opera_running:
+                        try:
+                            playwright.stop()
+                        except Exception:
+                            pass
+                        raise RuntimeError(
+                            "Opera GX is running but CDP endpoint is unreachable at "
+                            f"{endpoint}. Start Opera with scripts/vpn/open_opera_scraper.bat. Cause: {cdp_probe_error}"
+                        )
+                    self.store.add_event(
+                        run_id,
+                        f"CDP endpoint not reachable at {endpoint}; falling back to dedicated scraper instance. Cause: {cdp_probe_error}",
+                        level="warning",
+                    )
+
+        if self.settings.opera_gx_use_fresh_profile:
+            temp_profile_dir = (
+                self.settings.browser_state_dir
+                / "opera_gx_fresh_profiles"
+                / f"{run_id[:8]}_{int(time.time())}"
             )
-            temp_profile_dir = self._clone_camoufox_profile_snapshot(
-                run_id, source_user_data_dir
-            )
+            temp_profile_dir.mkdir(parents=True, exist_ok=True)
             effective_user_data_dir = temp_profile_dir
-        except Exception as exc:
-            if camoufox_running:
-                raise RuntimeError(
-                    "Camoufox appears to be open and profile cloning failed. Close Camoufox or point CAMOUFOX_USER_DATA_DIR to a dedicated scraper profile."
-                ) from exc
             self.store.add_event(
                 run_id,
-                f"Could not clone browser profile snapshot ({type(exc).__name__}); using source profile directly.",
-                level="warning",
+                "Using fresh temporary Opera GX profile for this run to avoid restored-tab/session interference.",
             )
+        else:
+            if opera_running and not self.settings.opera_gx_clone_profile_when_running:
+                temp_profile_dir = (
+                    self.settings.browser_state_dir
+                    / "opera_gx_isolated_profiles"
+                    / f"{run_id[:8]}_{int(time.time())}"
+                )
+                temp_profile_dir.mkdir(parents=True, exist_ok=True)
+                effective_user_data_dir = temp_profile_dir
+                self.store.add_event(
+                    run_id,
+                    "Opera GX is already running; using an isolated temporary scraper profile to avoid profile-lock browser closure.",
+                )
+            else:
+                try:
+                    self.store.add_event(
+                        run_id,
+                        "Creating isolated Opera GX profile snapshot for unattended scraping session.",
+                    )
+                    temp_profile_dir = self._clone_opera_gx_profile_snapshot(
+                        run_id, source_user_data_dir
+                    )
+                    effective_user_data_dir = temp_profile_dir
+                except Exception as exc:
+                    if opera_running:
+                        raise RuntimeError(
+                            "Opera GX appears to be open and profile cloning failed. Close Opera GX or point OPERA_GX_USER_DATA_DIR to a dedicated scraper profile."
+                        ) from exc
+                    self.store.add_event(
+                        run_id,
+                        f"Could not clone Opera GX profile snapshot ({type(exc).__name__}); using source profile directly.",
+                        level="warning",
+                    )
 
         launch_kwargs: dict[str, Any] = {
             "headless": self.settings.browser_headless,
-            "executable_path": self.settings.camoufox_executable_path,
+            "executable_path": self.settings.opera_gx_executable_path,
             "viewport": {
                 "width": self.settings.browser_viewport_width,
                 "height": self.settings.browser_viewport_height,
             },
-            "firefox_user_prefs": {
-                "browser.startup.page": 0,
-                "browser.startup.homepage": "about:blank",
-                "browser.startup.homepage_override.mstone": "ignore",
-                "startup.homepage_welcome_url": "about:blank",
-                "startup.homepage_welcome_url.additional": "",
-                "browser.sessionstore.resume_from_crash": False,
-                "browser.sessionstore.restore_on_demand": False,
-                "browser.sessionstore.max_resumed_crashes": 0,
-                "browser.shell.checkDefaultBrowser": False,
-                "browser.aboutwelcome.enabled": False,
-                "dom.webnotifications.enabled": False,
-                "permissions.default.desktop-notification": 2,
-            },
+            "args": [
+                "--disable-notifications",
+                "--disable-infobars",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
         }
+        if (not self.settings.browser_headless) and self.settings.browser_start_maximized:
+            launch_kwargs.pop("viewport", None)
+            launch_kwargs["no_viewport"] = True
+            launch_kwargs["args"].append("--start-maximized")
         if proxy:
             launch_kwargs["proxy"] = proxy.as_playwright_proxy()
 
         try:
-            context = playwright.firefox.launch_persistent_context(
+            context = playwright.chromium.launch_persistent_context(
                 str(effective_user_data_dir),
                 **launch_kwargs,
             )
@@ -624,7 +889,7 @@ class RunOrchestrator:
             if temp_profile_dir:
                 shutil.rmtree(temp_profile_dir, ignore_errors=True)
             raise RuntimeError(
-                "Could not launch Camoufox session. Ensure camoufox is installed and CAMOUFOX_USER_DATA_DIR is valid."
+                f"Could not launch Opera GX session. Ensure Opera GX is installed and OPERA_GX_USER_DATA_DIR is valid. Root cause: {type(exc).__name__}: {exc}"
             ) from exc
 
     def _is_closed_context_error(self, exc: Exception) -> bool:
@@ -893,20 +1158,52 @@ class RunOrchestrator:
             username_hint=username_hint,
         )
 
-        def _use_single_context_page(ctx: Any) -> Any:
+        def _use_single_context_page(ctx: Any, target_url: str | None = None) -> Any:
             try:
                 pages = [p for p in (ctx.pages or []) if not p.is_closed()]
             except Exception:
                 pages = []
 
+            self.store.add_event(
+                run_id,
+                f"Context ready with {len(pages)} open tab(s). Preparing active tab.",
+            )
+
             if pages:
                 page = pages[0]
-                for extra in pages[1:]:
-                    try:
-                        extra.close()
-                    except Exception:
-                        pass
+                target_host = ""
+                try:
+                    if target_url:
+                        target_host = (urlparse(target_url).hostname or "").lower()
+                except Exception:
+                    target_host = ""
+                if target_host:
+                    for candidate in pages:
+                        try:
+                            cu = (candidate.url or "").strip().lower()
+                        except Exception:
+                            cu = ""
+                        if target_host in cu:
+                            page = candidate
+                            break
+                extras = max(0, len(pages) - 1)
+                if extras > 0:
+                    closed = 0
+                    for extra in pages:
+                        if extra == page:
+                            continue
+                        try:
+                            extra.close()
+                            closed += 1
+                        except Exception:
+                            pass
+                    self.store.add_event(
+                        run_id,
+                        f"Closed {closed} additional startup tab(s); enforcing single-tab mode.",
+                        level="warning",
+                    )
             else:
+                self.store.add_event(run_id, "No open tabs found; creating a new tab.")
                 try:
                     page = ctx.new_page()
                 except Exception:
@@ -917,26 +1214,130 @@ class RunOrchestrator:
                     if not pages:
                         raise
                     page = pages[0]
-
+                self.store.add_event(
+                    run_id,
+                    "Recovered by reusing an existing tab after new-tab creation issue.",
+                    level="warning",
+                    )
             try:
-                page.goto(
-                    "https://www.instagram.com/",
-                    wait_until="domcontentloaded",
-                    timeout=20_000,
+                current = (page.url or "").strip().lower()
+            except Exception:
+                current = ""
+            if not current or current == "about:blank":
+                destination = "https://www.instagram.com/"
+                if target_url and target_url.startswith(("http://", "https://")):
+                    destination = target_url
+                self.store.add_event(
+                    run_id,
+                    f"Active tab is about:blank; navigating to {destination} for bootstrap.",
                 )
-                page.wait_for_timeout(max(500, self.settings.post_detail_wait_ms))
-            except Exception:
-                pass
-
-            try:
-                page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
-            except Exception:
-                pass
+                try:
+                    page.goto(
+                        destination,
+                        wait_until="commit",
+                        timeout=20_000,
+                    )
+                except Exception as exc:
+                    self.store.add_event(
+                        run_id,
+                        f"Bootstrap navigation warning: {type(exc).__name__}: {exc}",
+                        level="warning",
+                    )
             return page
 
-        page = _use_single_context_page(context)
+        page = _use_single_context_page(context, profile_url)
+
+        primary_page = page
+        challenge_popup_url: str | None = None
+
+        def _close_unexpected_page(new_page: Any) -> None:
+            nonlocal primary_page, page, challenge_popup_url
+            if new_page == primary_page:
+                return
+            try:
+                url = (new_page.url or "").strip()
+            except Exception:
+                url = ""
+            lowered = url.lower()
+            if "/challenge/" in lowered or "__coig_challenged=1" in lowered:
+                challenge_popup_url = url or "https://www.instagram.com/challenge/"
+                self.store.add_event(
+                    run_id,
+                    f"Instagram challenge tab opened ({challenge_popup_url}). Pausing run for manual challenge resolution.",
+                    level="warning",
+                )
+                return
+            if lowered.startswith("chrome://") or "gxcorner.games" in lowered:
+                self.store.add_event(
+                    run_id,
+                    f"Non-Instagram utility tab opened ({url or 'unknown'}); closing it.",
+                    level="warning",
+                )
+                try:
+                    new_page.close()
+                except Exception:
+                    pass
+                return
+            if "instagram.com" in lowered:
+                try:
+                    if primary_page is None or primary_page.is_closed():
+                        primary_page = new_page
+                        page = new_page
+                        self.store.add_event(
+                            run_id,
+                            f"Primary tab was closed; adopted newly opened Instagram tab ({url or 'unknown'}).",
+                            level="warning",
+                        )
+                        return
+                except Exception:
+                    pass
+                self.store.add_event(
+                    run_id,
+                    f"Unexpected duplicate Instagram tab opened ({url or 'unknown'}); closing duplicate.",
+                    level="warning",
+                )
+                try:
+                    new_page.close()
+                except Exception:
+                    pass
+                return
+            self.store.add_event(
+                run_id,
+                f"Unexpected extra tab opened ({url or 'unknown'}); closing it to enforce single-tab mode.",
+                level="warning",
+            )
+            try:
+                new_page.close()
+            except Exception:
+                pass
+
+        context.on("page", _close_unexpected_page)
+
+        def _is_off_target_page() -> bool:
+            try:
+                current_url = (page.url or "").strip().lower()
+            except Exception:
+                return False
+            if not current_url:
+                return False
+            if current_url.startswith("chrome://"):
+                return True
+            if "gxcorner.games" in current_url:
+                return True
+            if current_url.startswith("http://") or current_url.startswith("https://"):
+                return "instagram.com" not in current_url
+            return False
 
         def _check_cancel() -> None:
+            if challenge_popup_url:
+                raise ChallengeRequired(
+                    "Instagram challenge detected. Complete challenge in Opera GX and resume.",
+                    state={
+                        "stage": "challenge_popup",
+                        "profile_url": profile_url,
+                        "challenge_url": challenge_popup_url,
+                    },
+                )
             self._raise_if_stop_requested(run_id)
 
         _check_cancel()
@@ -951,7 +1352,7 @@ class RunOrchestrator:
         else:
             self.store.add_event(
                 run_id,
-                "Visible browser mode active. Camoufox opened automatically and scraping runs unattended while you spectate.",
+                "Visible browser mode active. Opera GX opened automatically and scraping runs unattended while you spectate.",
             )
 
         def _save_page_debug_artifacts(stage: str) -> dict[str, str | None]:
@@ -997,6 +1398,22 @@ class RunOrchestrator:
             recovery_url: str | None = None,
         ) -> bool:
             _check_cancel()
+            restricted, restriction_pattern = detect_account_restriction(page)
+            if restricted:
+                _log_problem_diagnostics(
+                    stage=str(state.get("stage") or "account_restricted"),
+                    reason=f"account_restricted:{restriction_pattern}",
+                )
+                self.store.update_run(run_id, challenge_encountered=True)
+                raise ChallengeRequired(
+                    "Instagram account appears restricted/blocked. Stop automation and review the account status manually before resuming.",
+                    state={
+                        "stage": "account_restricted",
+                        "profile_url": profile_url,
+                        "reason": restriction_pattern,
+                    },
+                )
+
             hit, pattern = detect_challenge(page)
             if not hit:
                 return True
@@ -1088,13 +1505,25 @@ class RunOrchestrator:
                 use_saved_session=use_saved_session,
                 username_hint=username_hint,
             )
-            page = _use_single_context_page(context)
+            page = _use_single_context_page(context, profile_url)
             active_proxy = proxy_manager.active
             if active_proxy:
                 self.store.update_run(run_id, proxy_id=active_proxy.proxy_id)
 
         try:
-            profile = scrape_profile_header(page, profile_url)
+            try:
+                profile = scrape_profile_header(page, profile_url)
+            except Exception as exc:
+                if challenge_popup_url:
+                    raise ChallengeRequired(
+                        "Instagram challenge detected during profile navigation. Complete challenge in Opera GX and resume.",
+                        state={
+                            "stage": "challenge_popup",
+                            "profile_url": profile_url,
+                            "challenge_url": challenge_popup_url,
+                        },
+                    ) from exc
+                raise
             profile_challenge_cleared = _check_challenge_with_recovery(
                 {"stage": "profile_header", "profile_url": profile_url},
                 recovery_url=profile_url,
@@ -1196,7 +1625,31 @@ class RunOrchestrator:
                 if isinstance(max_entities, int) and max_entities > 0
                 else self.settings.max_posts_per_profile
             )
+            vpn_rotate_every_n = max(0, self.settings.vpn_rotate_every_n)
+            reels_tab_max_items = self.settings.reels_tab_max_items
+            if reels_tab_max_items <= 0:
+                if isinstance(entity_limit, int) and entity_limit > 0:
+                    reels_tab_max_items = entity_limit
+                elif vpn_rotate_every_n > 0:
+                    reels_tab_max_items = max(120, vpn_rotate_every_n)
+                else:
+                    reels_tab_max_items = 120
+
+            reels_tab_max_scroll_rounds = self.settings.reels_tab_max_scroll_rounds
+            if reels_tab_max_scroll_rounds <= 0:
+                reels_tab_max_scroll_rounds = max(
+                    12, min(40, 8 + (reels_tab_max_items // 10))
+                )
             stats_only_mode = bool(stats_only)
+            download_media_assets = (
+                self.settings.download_media_assets and not stats_only_mode
+            )
+            skip_media_shortcodes = self.settings.skip_media_shortcodes
+            skip_media_urls = self.settings.skip_media_urls
+            self.store.add_event(
+                run_id,
+                f"VPN rotation config: every_n={vpn_rotate_every_n}, command={'set' if bool(self.settings.vpn_rotate_command) else 'unset'}, wait_s={self.settings.vpn_rotate_wait_seconds}.",
+            )
             sample_collection_mode = (
                 self.settings.sample_collection_mode and not stats_only_mode
             )
@@ -1239,6 +1692,62 @@ class RunOrchestrator:
                 )
             profile_started_monotonic = time.monotonic()
             stop_post_loop_due_runtime_budget = False
+            scraped_count = 0
+
+            def _should_skip_media(shortcode: str | None, post_url: str | None) -> bool:
+                if shortcode and shortcode in skip_media_shortcodes:
+                    return True
+                if post_url and post_url in skip_media_urls:
+                    return True
+                if post_url and post_url.rstrip("/") in skip_media_urls:
+                    return True
+                return False
+
+            def _maybe_pause_for_vpn_rotation(
+                current_index: int,
+                discovered_rows: list[dict[str, Any]],
+            ) -> None:
+                if vpn_rotate_every_n <= 0:
+                    return
+                if scraped_count <= 0 or scraped_count % vpn_rotate_every_n != 0:
+                    return
+                if current_index >= len(discovered_rows) - 1:
+                    return
+                if self.settings.vpn_rotate_command:
+                    self.store.add_event(
+                        run_id,
+                        f"Auto-rotating VPN after {scraped_count} media.",
+                        level="warning",
+                    )
+                    ok = self._run_vpn_rotate_command(run_id)
+                    if ok:
+                        wait_seconds = max(0.0, self.settings.vpn_rotate_wait_seconds)
+                        if wait_seconds > 0:
+                            self._sleep_interruptible(run_id, wait_seconds)
+                        return
+                    self.store.add_event(
+                        run_id,
+                        "VPN auto-rotation failed; manual rotation required.",
+                        level="warning",
+                    )
+                state = {
+                    "stage": "vpn_rotation",
+                    "profile_url": profile_url,
+                    "discovered_posts": discovered_rows,
+                    "processed_shortcodes": list(processed),
+                    "partial_posts_rows": posts_rows,
+                    "current_post_index": current_index,
+                }
+                self.store.add_event(
+                    run_id,
+                    f"VPN rotation required after {scraped_count} media. Switch Opera GX VPN location and resume the run.",
+                    level="warning",
+                )
+                raise ManualStepRequired(
+                    "VPN rotation required after batch scrape",
+                    state=state,
+                    error_code="vpn_rotation_required",
+                )
 
             def _should_stop_for_runtime_budget() -> bool:
                 nonlocal stop_post_loop_due_runtime_budget
@@ -1283,6 +1792,11 @@ class RunOrchestrator:
                 self.store.add_event(
                     run_id,
                     "Stats-only mode enabled: skipping media-file download and prioritizing reel metrics extraction speed.",
+                )
+            if not self.settings.download_media_assets:
+                self.store.add_event(
+                    run_id,
+                    "Media download disabled: recording only remote media URLs.",
                 )
             if force_reel_detail_mode:
                 self.store.add_event(
@@ -1353,7 +1867,7 @@ class RunOrchestrator:
                         level="warning",
                     )
 
-                    # Avoid heavy relaunch loops when Camoufox is already running.
+                    # Avoid heavy relaunch loops when Opera GX is already running.
                     if self._is_closed_context_error(exc):
                         self.store.add_event(
                             run_id,
@@ -1385,8 +1899,8 @@ class RunOrchestrator:
                             page,
                             profile_url,
                             wait_ms=max(1200, self.settings.post_detail_wait_ms * 3),
-                            max_items=30,
-                            max_scroll_rounds=8,
+                            max_items=min(reels_tab_max_items, 50),
+                            max_scroll_rounds=min(reels_tab_max_scroll_rounds, 10),
                         )
                         reels_tab_by_shortcode = {
                             str(item.get("shortcode")): item
@@ -1601,14 +2115,8 @@ class RunOrchestrator:
                         if reels_fast_stats_mode
                         else max(1500, self.settings.post_detail_wait_ms * 4)
                     ),
-                    max_items=(
-                        entity_limit if entity_limit and entity_limit > 0 else 120
-                    ),
-                    max_scroll_rounds=(
-                        max(8, self.settings.scroll_idle_rounds * 2)
-                        if reels_fast_stats_mode
-                        else max(12, self.settings.scroll_idle_rounds * 4)
-                    ),
+                    max_items=reels_tab_max_items,
+                    max_scroll_rounds=reels_tab_max_scroll_rounds,
                 )
                 reels_discovered = [
                     {
@@ -1724,7 +2232,7 @@ class RunOrchestrator:
                                 page,
                                 profile_url,
                                 wait_ms=max(900, self.settings.post_detail_wait_ms * 3),
-                                max_items=target_entities,
+                                max_items=reels_tab_max_items,
                                 max_scroll_rounds=max(
                                     14, self.settings.scroll_idle_rounds * 4
                                 ),
@@ -1796,6 +2304,24 @@ class RunOrchestrator:
                     if (str(row.get("media_type_hint") or "").strip().lower() == "reel")
                     or "/reel/" in str(row.get("post_url") or "").strip().lower()
                 ]
+
+            if skip_media_shortcodes or skip_media_urls:
+                before = len(discovered)
+                discovered = [
+                    row
+                    for row in discovered
+                    if not _should_skip_media(
+                        str(row.get("shortcode") or "") or None,
+                        str(row.get("post_url") or "") or None,
+                    )
+                ]
+                skipped = before - len(discovered)
+                if skipped > 0:
+                    self.store.add_event(
+                        run_id,
+                        f"Skipped {skipped} media from skip list.",
+                        level="warning",
+                    )
 
             if (
                 not sample_collection_mode
@@ -1924,6 +2450,10 @@ class RunOrchestrator:
                     break
                 shortcode = post.get("shortcode")
                 if not shortcode or shortcode in processed:
+                    continue
+                post_url = str(post.get("post_url") or "")
+                if _should_skip_media(str(shortcode), post_url or None):
+                    processed.add(shortcode)
                     continue
                 timeline_fallback = timeline_by_shortcode.get(str(shortcode), {})
                 reels_tab_fallback = reels_tab_by_shortcode.get(str(shortcode), {})
@@ -2066,6 +2596,8 @@ class RunOrchestrator:
 
                     posts_rows.append({k: fast_row.get(k) for k in POSTS_COLUMNS})
                     processed.add(shortcode)
+                    scraped_count += 1
+                    _maybe_pause_for_vpn_rotation(i, discovered)
                     continue
 
                 previous_proxy_id = proxy_manager.current_proxy_id()
@@ -2092,6 +2624,15 @@ class RunOrchestrator:
                     _check_cancel()
                     if _should_stop_for_runtime_budget():
                         break
+                    if _is_off_target_page():
+                        self.store.add_event(
+                            run_id,
+                            "Active page moved away from Instagram; relaunching session before retry.",
+                            level="warning",
+                        )
+                        _relaunch_browser_session(
+                            f"Relaunching browser session because active page is off-target before post {i + 1}"
+                        )
                     attempts += 1
                     try:
                         if sample_collection_mode:
@@ -2224,7 +2765,7 @@ class RunOrchestrator:
 
                         media_asset_local_paths: list[str] = []
                         if (
-                            not stats_only_mode
+                            download_media_assets
                             and sample_bucket
                             and not sample_captured[sample_bucket]
                             and media_asset_urls
@@ -2274,6 +2815,7 @@ class RunOrchestrator:
                         }
                         posts_rows.append({k: row.get(k) for k in POSTS_COLUMNS})
                         processed.add(shortcode)
+                        scraped_count += 1
                         consecutive_rate_limits = 0
                         self.store.update_run(
                             run_id,
@@ -2296,9 +2838,20 @@ class RunOrchestrator:
                                 "Sample collection mode: captured posts and reels; stopping early.",
                             )
                             break
+                        _maybe_pause_for_vpn_rotation(i, discovered)
                         break
                     except Exception as exc:
                         last_error = exc
+                        if _is_off_target_page():
+                            self.store.add_event(
+                                run_id,
+                                f"Post navigation failed on off-target page ({type(exc).__name__}); relaunching session immediately.",
+                                level="warning",
+                            )
+                            _relaunch_browser_session(
+                                f"Relaunching browser session after off-target failure on post {i + 1}"
+                            )
+                            continue
                         is_rate_limited = self._is_rate_limited_error(exc, page)
                         if is_rate_limited:
                             consecutive_rate_limits += 1

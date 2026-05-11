@@ -11,9 +11,9 @@ requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.115.0",
   "uvicorn>=0.30.0",
+  "watchfiles>=0.21.0",
   "pydantic>=2.7.0",
   "playwright>=1.52.0",
-  "camoufox>=0.4.11",
   "requests>=2.32.0",
   "python-dateutil>=2.9.0",
   "tzdata>=2024.1",

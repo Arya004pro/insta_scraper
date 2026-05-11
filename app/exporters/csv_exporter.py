@@ -40,6 +40,18 @@ PROFILE_CONTENT_COLUMNS = [
 ]
 
 
+PROFILE_BIO_COLUMNS = [
+    "scraped_at_ist",
+    "run_id",
+    "username",
+    "profile_url",
+    "full_name",
+    "biography",
+    "email_address",
+    "external_url_primary",
+]
+
+
 def _write_csv(path: Path, columns: list[str], rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -188,6 +200,10 @@ def export_csv_artifacts(
     profiles_rollup_csv = exports_dir / "instagram_profiles_rollup.csv"
     _upsert_rollup_rows(profiles_rollup_csv, summary_flat_rows)
 
+    profiles_bio_csv = exports_dir / "instagram_profiles_bio.csv"
+    bio_rows = [{k: row.get(k) for k in PROFILE_BIO_COLUMNS} for row in profile_rows]
+    _write_csv(profiles_bio_csv, PROFILE_BIO_COLUMNS, bio_rows)
+
     _ = run_log_rows
     _ = highlights_rows
     _ = aggregate_rows
@@ -197,4 +213,5 @@ def export_csv_artifacts(
     _ = EXTERNAL_LINKS_COLUMNS
 
     artifacts["profiles_rollup_csv"] = str(profiles_rollup_csv.resolve())
+    artifacts["profiles_bio_csv"] = str(profiles_bio_csv.resolve())
     return artifacts

@@ -17,6 +17,15 @@ CHALLENGE_PATTERNS = [
     re.compile(r"temporarily blocked", re.IGNORECASE),
 ]
 
+ACCOUNT_RESTRICTION_PATTERNS = [
+    re.compile(r"your account has been temporarily blocked", re.IGNORECASE),
+    re.compile(r"we restrict certain activity", re.IGNORECASE),
+    re.compile(r"account (?:has been )?disabled", re.IGNORECASE),
+    re.compile(r"account suspended", re.IGNORECASE),
+    re.compile(r"violat(?:e|ed) our community guidelines", re.IGNORECASE),
+    re.compile(r"appeal this decision", re.IGNORECASE),
+]
+
 
 def collect_page_diagnostics(page: object) -> dict[str, str | None]:
     try:
@@ -91,4 +100,21 @@ def detect_challenge(page: object) -> tuple[bool, str | None]:
             return True, "login_buttons"
     except Exception:
         pass
+    return False, None
+
+
+def detect_account_restriction(page: object) -> tuple[bool, str | None]:
+    diagnostics = collect_page_diagnostics(page)
+    text = diagnostics.get("body_snippet") or ""
+    title = diagnostics.get("title") or ""
+    url = (diagnostics.get("url") or "").lower()
+    combined_text = f"{title}\n{text}"
+
+    if "/accounts/suspended" in url or "/accounts/disabled" in url:
+        return True, "account_restriction_url"
+
+    for pattern in ACCOUNT_RESTRICTION_PATTERNS:
+        if pattern.search(combined_text):
+            return True, pattern.pattern
+
     return False, None

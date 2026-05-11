@@ -9,7 +9,11 @@ from app.core.models import (
     PROFILE_COLUMNS,
     RUN_LOG_COLUMNS,
 )
-from app.exporters.csv_exporter import PROFILE_CONTENT_COLUMNS, export_csv_artifacts
+from app.exporters.csv_exporter import (
+    PROFILE_BIO_COLUMNS,
+    PROFILE_CONTENT_COLUMNS,
+    export_csv_artifacts,
+)
 from app.exporters.xlsx_exporter import export_xlsx_artifacts
 
 
@@ -48,6 +52,7 @@ def test_csv_export_contract(tmp_path: Path):
 
     assert set(artifacts.keys()) == {
         "profile_content_csv",
+        "profiles_bio_csv",
         "profiles_rollup_csv",
     }
 
@@ -60,6 +65,10 @@ def test_csv_export_contract(tmp_path: Path):
     rollup_header = rollup_csv.read_text(encoding="utf-8").splitlines()[0].split(",")
     assert "Run ID" in rollup_header
     assert "Username" in rollup_header
+
+    bio_csv = Path(artifacts["profiles_bio_csv"])
+    bio_header = bio_csv.read_text(encoding="utf-8").splitlines()[0].split(",")
+    assert bio_header == PROFILE_BIO_COLUMNS
 
 
 def test_xlsx_export_contract(tmp_path: Path):

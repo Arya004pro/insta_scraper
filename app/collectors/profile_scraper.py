@@ -426,29 +426,74 @@ def _nudge_page_interaction(page: object) -> None:
         pass
 
 
+def _is_nav_aborted_error(exc: Exception) -> bool:
+    return "err_aborted" in str(exc).lower()
+
+
+def _is_usable_instagram_page(page: object) -> bool:
+    try:
+        current = (page.url or "").lower()
+    except Exception:
+        return False
+    return "instagram.com" in current and "about:blank" not in current
+
+
 def _navigate_profile(page: object, profile_url: str) -> None:
-    for _ in range(3):
+    last_error: Exception | None = None
+
+    for _ in range(4):
         try:
-            page.goto(profile_url, wait_until="domcontentloaded")
+            page.goto(profile_url, wait_until="domcontentloaded", timeout=30_000)
             page.wait_for_timeout(700)
             _nudge_page_interaction(page)
-            current = (page.url or "").lower()
-            if "instagram.com" in current and "about:blank" not in current:
+            if _is_usable_instagram_page(page):
                 return
-        except Exception:
-            pass
+        except Exception as exc:
+            last_error = exc
+
+            if _is_nav_aborted_error(exc):
+                try:
+                    page.wait_for_timeout(900)
+                    _nudge_page_interaction(page)
+                    if _is_usable_instagram_page(page):
+                        return
+                except Exception:
+                    pass
+
+                try:
+                    page.goto(profile_url, wait_until="commit", timeout=30_000)
+                    page.wait_for_timeout(900)
+                    _nudge_page_interaction(page)
+                    if _is_usable_instagram_page(page):
+                        return
+                except Exception as commit_exc:
+                    last_error = commit_exc
+
+                try:
+                    page.evaluate(
+                        "(url) => { window.location.href = url; }", profile_url
+                    )
+                    page.wait_for_timeout(1200)
+                    _nudge_page_interaction(page)
+                    if _is_usable_instagram_page(page):
+                        return
+                except Exception as eval_exc:
+                    last_error = eval_exc
 
         try:
-            page.goto("https://www.instagram.com/", wait_until="domcontentloaded")
+            page.goto(
+                "https://www.instagram.com/",
+                wait_until="domcontentloaded",
+                timeout=20_000,
+            )
             page.wait_for_timeout(450)
             _nudge_page_interaction(page)
         except Exception:
             pass
 
-    # Last attempt should bubble failures to existing parse fallbacks.
-    page.goto(profile_url, wait_until="domcontentloaded")
-    page.wait_for_timeout(700)
-    _nudge_page_interaction(page)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Could not navigate to profile URL: {profile_url}")
 
 
 def _normalize_external_candidate(raw: str | None, base_url: str) -> str | None:

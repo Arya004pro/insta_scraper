@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -13,6 +14,8 @@ from app.core.models import RunContext
 class SQLiteStore:
     def __init__(self, path: Path):
         self._path = path
+        emit_raw = os.getenv("LOG_RUN_EVENTS_TO_STDOUT", "1").strip().lower()
+        self._emit_stdout = emit_raw in {"1", "true", "yes", "on"}
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._init_db()
@@ -153,12 +156,16 @@ class SQLiteStore:
         )
 
     def add_event(self, run_id: str, message: str, level: str = "info") -> None:
+        at_ist = iso_ist(now_ist())
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO run_events(run_id, at_ist, message, level) VALUES (?, ?, ?, ?)",
-                (run_id, iso_ist(now_ist()), message, level),
+                (run_id, at_ist, message, level),
             )
             conn.commit()
+        if self._emit_stdout:
+            short_run = run_id[:8]
+            print(f"{at_ist} [{level}] [{short_run}] {message}", flush=True)
 
     def get_events(self, run_id: str) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:

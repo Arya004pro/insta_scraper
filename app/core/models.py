@@ -158,8 +158,8 @@ class StartRunRequest(BaseModel):
     use_saved_session: bool = True
     proxy_pool_id: str | None = None
     max_entities: int | None = Field(default=None, ge=1, le=5000)
-    fast_mode: bool = True
-    reels_only: bool = True
+    fast_mode: bool = False
+    reels_only: bool = False
     stats_only: bool = True
 
     @field_validator("input_value")
